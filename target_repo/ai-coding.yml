@@ -13,7 +13,7 @@ env:
   BASE_BRANCH: develop
 
 jobs:
-  codex-plan:
+  opus-plan:
     runs-on: ubuntu-latest
     env:
       JIRA_BASE: ${{ secrets.JIRA_BASE }}
@@ -111,15 +111,24 @@ jobs:
             echo "✅ Image context built successfully"
           fi
 
-      - name: Codex - produce plan (TSD) as text
-        id: codex
-        uses: openai/codex-action@v1
+      - name: Claude Opus 4.5 - produce plan (TSD)
+        id: opus-plan
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
           prompt: |
-            You are a senior software engineer and technical planner. Your task is to create a COMPLETE, ACTIONABLE implementation plan for Claude Code to execute.
+            You are a senior software architect using Claude Opus 4.5. Your task is to create a COMPLETE, ACTIONABLE implementation plan.
 
-            IMPORTANT: Output the FULL PLAN as markdown text. Do NOT output references to existing files or placeholder text like "Plan documented in tsd.md". Claude Code needs the complete plan in your output.
+            IMPORTANT:
+            - You are ONLY creating a plan, NOT implementing code
+            - Output the FULL PLAN as markdown text
+            - Do NOT create any files or make any code changes
+            - Just analyze and output the plan to stdout
 
             Context: This is a Next.js 14 (App Router) + PostgreSQL + Socket.IO sales platform. The codebase has TSD.md with architecture overview, but you must create NEW specific implementation steps for THIS task.
 
@@ -129,9 +138,14 @@ jobs:
             - Description:
             ${{ steps.jira.outputs.description }}
 
-            ${{ steps.fetch-images.outputs.has_images == 'true' && format('NOTE: This ticket has {0} attached image(s) showing visual context (UI mockups, screenshots, diagrams). Claude Code will receive these images during implementation. Include visual considerations in your plan where relevant.', steps.fetch-images.outputs.image_count) || '' }}
+            ${{ steps.fetch-images.outputs.has_images == 'true' && format('NOTE: This ticket has {0} attached image(s) showing visual context (UI mockups, screenshots, diagrams). The implementation agent will receive these images. Include visual considerations in your plan where relevant.', steps.fetch-images.outputs.image_count) || '' }}
 
-            Required Output Format (output as markdown):
+            FIRST: Read and understand the codebase structure:
+            - Read TSD.md for architecture overview
+            - Explore relevant directories to understand patterns
+            - Check existing similar implementations
+
+            THEN: Output your plan in this format:
 
             # Implementation Plan for ${{ steps.payload.outputs.issue_key }}
 
@@ -174,6 +188,14 @@ jobs:
             - [ ] [Specific testable criterion 3]
             - [ ] [Add 3-6 total checkboxes]
 
+            ## 5. Code Examples
+            For each file to create/modify, provide the COMPLETE code:
+
+            ### File: `path/to/file.ts`
+            ```typescript
+            // Complete implementation code here
+            ```
+
             ## 6. Risks and Mitigations
             - **Risk:** [specific risk]
               **Mitigation:** [how to handle it]
@@ -184,28 +206,25 @@ jobs:
             [specific commands]
             ```
 
-            **To Rollback:**
-            ```bash
-            [specific rollback steps]
-            ```
-
             **To Verify:**
             - [How to check it's working]
 
             CRITICAL RULES:
-            1. Output the COMPLETE plan text, not a reference to a file
-            2. Be specific with file paths (use actual repo structure)
-            3. Include concrete implementation details
-            4. Reference existing patterns from TSD.md where relevant
-            5. Keep it actionable - Claude Code should be able to implement directly from this plan
-            6. If task seems already implemented, state that clearly and suggest verification steps only
-          effort: "high"
+            1. Read the codebase first to understand existing patterns
+            2. Output the COMPLETE plan with FULL CODE EXAMPLES
+            3. Be specific with file paths (use actual repo structure)
+            4. Include concrete implementation details that can be directly used
+            5. If task seems already implemented, state that clearly
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 30
+            --model claude-opus-4-5-20251101
 
       - name: Save plan to artifact
         run: |
           mkdir -p .artifacts
           cat > .artifacts/PLAN.md << 'EOF'
-          ${{ steps.codex.outputs.final-message }}
+          ${{ steps.opus-plan.outputs.response }}
           EOF
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
@@ -220,15 +239,20 @@ jobs:
           name: image-context
           path: .artifacts/image-context.md
 
-  claude-implement:
+  gemini-implement:
     runs-on: ubuntu-latest
-    needs: codex-plan
+    needs: opus-plan
     permissions:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -265,93 +289,223 @@ jobs:
             echo "has_images=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Claude Code - review plan and implement, then open PR
-        uses: anthropics/claude-code-action@v1
+      - name: Setup Git
+        run: |
+          git config user.name "Azmi Bot"
+          git config user.email "azmi-bot@users.noreply.github.com"
+
+      - name: Create feature branch
+        id: branch
+        run: |
+          ISSUE_KEY="${{ github.event.client_payload.issue_key || 'ai-task' }}"
+          BRANCH_NAME="feature/${ISSUE_KEY}"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Created branch: $BRANCH_NAME"
+
+      - name: Gemini 3 Pro - implement code from plan
+        id: gemini-implement
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🚀 Starting Gemini 3 Pro implementation..."
+
+          # Read the plan
+          PLAN=$(cat .artifacts/PLAN.md)
+
+          # Build the implementation prompt
+          cat > .artifacts/implement-prompt.txt << 'PROMPT_EOF'
+          You are a senior software engineer implementing code based on a detailed plan.
+
+          TASK: Implement the code changes described in the plan below.
+
+          IMPORTANT OUTPUT FORMAT:
+          You must output a JSON object with this exact structure:
+          {
+            "files": [
+              {
+                "path": "relative/path/to/file.ts",
+                "action": "create" | "modify" | "delete",
+                "content": "full file content here"
+              }
+            ],
+            "commit_message": "descriptive commit message",
+            "pr_body": "markdown description for PR"
+          }
+
+          RULES:
+          1. For "create" action: provide the complete new file content
+          2. For "modify" action: provide the COMPLETE file content (not just changes)
+          3. For "delete" action: content can be empty
+          4. Follow the plan exactly - implement all specified changes
+          5. Use TypeScript/JavaScript best practices
+          6. Include proper error handling
+          7. Follow existing code patterns mentioned in the plan
+
+          IMPLEMENTATION PLAN:
+          ---
+          PROMPT_EOF
+
+          echo "$PLAN" >> .artifacts/implement-prompt.txt
+
+          # Build Gemini request with structured output
+          jq -n \
+            --rawfile prompt .artifacts/implement-prompt.txt \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{text: $prompt}]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.2,
+                maxOutputTokens: 65536
+              }
+            }' > .artifacts/gemini-implement-request.json
+
+          echo "📤 Sending implementation request to Gemini 3 Pro..."
+
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/gemini-implement-request.json > .artifacts/gemini-response.json
+
+          echo "📥 Response received"
+
+          # Extract the JSON response
+          RESPONSE_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/gemini-response.json)
+          echo "$RESPONSE_TEXT" > .artifacts/implementation.json
+
+          echo "✅ Implementation plan parsed"
+
+      - name: Apply code changes
+        id: apply-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📝 Applying code changes..."
+
+          # Parse the implementation JSON
+          IMPL_JSON=$(cat .artifacts/implementation.json)
+
+          # Process each file
+          echo "$IMPL_JSON" | jq -c '.files[]' | while IFS= read -r file; do
+            FILE_PATH=$(echo "$file" | jq -r '.path')
+            ACTION=$(echo "$file" | jq -r '.action')
+            CONTENT=$(echo "$file" | jq -r '.content')
+
+            echo "Processing: $FILE_PATH ($ACTION)"
+
+            case "$ACTION" in
+              "create"|"modify")
+                # Create directory if needed
+                mkdir -p "$(dirname "$FILE_PATH")"
+                # Write file content
+                echo "$CONTENT" > "$FILE_PATH"
+                echo "✅ Written: $FILE_PATH"
+                ;;
+              "delete")
+                if [ -f "$FILE_PATH" ]; then
+                  rm "$FILE_PATH"
+                  echo "🗑️  Deleted: $FILE_PATH"
+                fi
+                ;;
+            esac
+          done
+
+          # Extract commit message and PR body
+          echo "$IMPL_JSON" | jq -r '.commit_message' > .artifacts/commit-message.txt
+          echo "$IMPL_JSON" | jq -r '.pr_body' > .artifacts/pr-body.txt
+
+          echo "✅ All changes applied"
+
+      - name: Commit and push changes
+        id: commit
+        run: |
+          ISSUE_KEY="${{ github.event.client_payload.issue_key || 'ai-task' }}"
+          BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
+
+          # Check if there are changes
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "⚠️  No changes to commit"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git add -A
+
+          # Use commit message from Gemini or default
+          if [ -f .artifacts/commit-message.txt ]; then
+            COMMIT_MSG=$(cat .artifacts/commit-message.txt)
+          else
+            COMMIT_MSG="Implement ${ISSUE_KEY}"
+          fi
+
+          git commit -m "$COMMIT_MSG
+
+          🤖 Implemented by Gemini 3 Pro
+          📋 Planned by Claude Opus 4.5"
+
+          git push -u origin "$BRANCH_NAME"
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "✅ Changes committed and pushed to $BRANCH_NAME"
+
+      - name: Create Pull Request
+        if: steps.commit.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GH_PAT }}
-          show_full_output: true
-          prompt: |
-            You are Claude Code working on ${{ github.repository }}.
+        run: |
+          ISSUE_KEY="${{ github.event.client_payload.issue_key || 'ai-task' }}"
+          BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
 
-            CONTEXT:
-            - Repository: Win Room v2.0 - Next.js 14 + PostgreSQL + Socket.IO sales platform
-            - Architecture documented in TSD.md
-            - Task: ${{ github.event.client_payload.issue_key || 'Task' }}
+          # Build PR body
+          if [ -f .artifacts/pr-body.txt ]; then
+            PR_DESCRIPTION=$(cat .artifacts/pr-body.txt)
+          else
+            PR_DESCRIPTION="Implementation for ${ISSUE_KEY}"
+          fi
 
-            ${{ steps.read-images.outputs.has_images == 'true' && steps.read-images.outputs.context || '' }}
+          # Read the plan for PR body
+          PLAN=$(cat .artifacts/PLAN.md)
 
-            IMPLEMENTATION PLAN FROM CODEX:
-            ---
-            ${{ steps.read-plan.outputs.plan }}
-            ---
+          PR_BODY="## 🤖 AI Coding - ${ISSUE_KEY}
 
-            YOUR WORKFLOW:
+          ### Implementation Plan (by Claude Opus 4.5)
+          <details>
+          <summary>Click to expand plan</summary>
 
-            1. VALIDATE THE PLAN:
-               - Read the plan carefully
-               - Check if requirements are already implemented in the codebase
-               - If already implemented: document what exists and suggest only verification steps
-               - If gaps exist: refine the plan with specific file paths and implementation details
-               - Create your "Final Implementation Plan" (can be same as Codex plan if it's good)
-               - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
-               - No human is available to approve - execute all changes autonomously.
+          ${PLAN}
 
-            2. IMPLEMENT THE CHANGES:
-               - Follow the Final Implementation Plan step by step
-               - Make minimal, safe changes
-               - Ensure code follows existing patterns in the repo
-               - Add appropriate error handling
-               - Update types/interfaces as needed
-               - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
-               - No human is available to approve - execute all changes autonomously.
+          </details>
 
-            3. COMMIT AND PUSH:
-               - Create feature branch: `git checkout -b feature/${{ github.event.client_payload.issue_key || 'ai-task' }}`
-               - Stage changes: `git add -A`
-               - Commit with message: `git commit -m "Implement ${{ github.event.client_payload.issue_key || 'task' }}"`
-               - Push to remote: `git push -u origin feature/${{ github.event.client_payload.issue_key || 'ai-task' }}`
+          ### Changes Made (by Gemini 3 Pro)
+          ${PR_DESCRIPTION}
 
-            4. CREATE PULL REQUEST:
-               - Use GitHub CLI to create PR: `gh pr create --title "..." --body "..." --base ${{ env.BASE_BRANCH }}`
-               - PR Title: "AI Coding - ${{ github.event.client_payload.issue_key || 'Task' }}"
-               - PR Body must include:
-                 * **Final Implementation Plan** (your validated/refined plan)
-                 * **Changes Made** (bullet list of files changed and why)
-                 * **Notes** (any important considerations for reviewers)
-               - CRITICAL: You MUST create the PR. Use gh pr create command.
-               - Do not ask for approval. Execute the gh pr create command automatically.
+          ---
+          🧠 **Planned by:** Claude Opus 4.5
+          ⚡ **Implemented by:** Gemini 3 Pro
+          "
 
-            IMPORTANT RULES:
-            - If the feature is already 90%+ implemented, create a PR that just adds/modifies documentation
-            - Always create a PR even if changes are minimal - the PR is the deliverable
-            - Include clear commit messages
-            - Make sure all file paths in commits are correct
-            - Run any relevant build/lint commands before pushing
-            - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
-            - No human is available to approve - execute all changes autonomously.
+          # Create PR
+          gh pr create \
+            --title "AI Coding - ${ISSUE_KEY}" \
+            --body "$PR_BODY" \
+            --base "${{ env.BASE_BRANCH }}" \
+            --head "$BRANCH_NAME"
 
-            CRITICAL: You are running in CI/CD environment. DO NOT ASK FOR APPROVAL.
-            Automatically proceed with all file operations, git commands, and implementations.
-            No human is available to approve - execute all changes autonomously.
+          echo "✅ Pull Request created"
 
-            BEGIN IMPLEMENTATION NOW.
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 100
-            --model claude-sonnet-4-5-20250929
-
-      - name: Post implementation start to Jira
+      - name: Post implementation status to Jira
         if: always()
         env:
           JIRA_BASE: ${{ secrets.JIRA_BASE }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
-          ISSUE_KEY='${{ steps.payload.outputs.issue_key }}'
+          ISSUE_KEY='${{ github.event.client_payload.issue_key }}'
 
           if [ -z "$ISSUE_KEY" ] || [ "$ISSUE_KEY" = "null" ]; then
             echo "No Jira issue key found, skipping Jira update"
@@ -377,7 +531,7 @@ jobs:
                   {
                     type: "paragraph",
                     content: [
-                      { type: "text", text: "Claude Code is implementing the changes for this ticket." }
+                      { type: "text", text: "Implementation in progress using Claude Opus 4.5 (planning) + Gemini 3 Pro (coding)." }
                     ]
                   },
                   {
@@ -410,4 +564,4 @@ jobs:
             -H "Content-Type: application/json" \
             -d @/tmp/jira-comment.json
 
-          echo "✅ Posted implementation start to Jira issue $ISSUE_KEY"
+          echo "✅ Posted implementation status to Jira issue $ISSUE_KEY"

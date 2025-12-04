@@ -13,7 +13,7 @@ env:
   BASE_BRANCH: main
 
 jobs:
-  codex-revision-plan:
+  opus-revision-plan:
     runs-on: ubuntu-latest
     env:
       JIRA_BASE: ${{ secrets.JIRA_BASE }}
@@ -93,15 +93,26 @@ jobs:
             echo "has_pr=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Codex - create revision plan
-        id: codex
-        uses: openai/codex-action@v1
+      - name: Claude Opus 4.5 - create revision plan
+        id: opus-plan
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
           prompt: |
-            You are a senior software engineer creating a REVISION PLAN for an existing implementation.
+            You are a senior software architect using Claude Opus 4.5. Create a REVISION PLAN for an existing implementation.
 
-            NOTE: This ticket may have attached images showing visual context (UI mockups, bugs, before/after). Claude Code will receive these images during implementation. Include visual considerations in your plan where relevant.
+            IMPORTANT:
+            - You are ONLY creating a revision plan, NOT implementing code
+            - Output the FULL PLAN as markdown text
+            - Do NOT create any files or make any code changes
+            - Just analyze and output the plan to stdout
+
+            NOTE: This ticket may have attached images showing visual context (UI mockups, bugs, before/after). The implementation agent will receive these images during implementation.
 
             CONTEXT:
             This is a Next.js 14 (App Router) + PostgreSQL + Socket.IO sales platform.
@@ -117,9 +128,12 @@ jobs:
             REVISION REQUEST:
             ${{ steps.payload.outputs.revision_comment }}
 
-            Your task: Create a COMPLETE, ACTIONABLE revision plan that addresses the feedback above.
+            FIRST: Read and understand the codebase:
+            - Read TSD.md for architecture overview
+            - Examine the files mentioned in the previous PR
+            - Understand what was implemented and what needs to change
 
-            Required Output Format (output as markdown):
+            THEN: Output your revision plan in this format:
 
             # Revision Plan for ${{ steps.payload.outputs.issue_key }}
 
@@ -144,33 +158,43 @@ jobs:
             - Specific change 1
             - Specific change 2
 
-            ## 4. Testing Requirements
+            ## 4. Code Examples
+            For each file to modify, provide the COMPLETE updated code:
+
+            ### File: `path/to/file.ts`
+            ```typescript
+            // Complete implementation code here
+            ```
+
+            ## 5. Testing Requirements
             **New/Updated Tests:**
             - Test [specific scenario]
             - Verify [specific behavior]
 
             **Manual Verification:**
             - [How to verify the fix works]
-            - [What to check in staging]
 
-            ## 5. Acceptance Criteria
+            ## 6. Acceptance Criteria
             - [ ] [Specific testable criterion 1]
             - [ ] [Specific testable criterion 2]
             - [ ] [Original issue is resolved]
 
             CRITICAL RULES:
-            1. Output the COMPLETE plan text, not a reference to a file
-            2. Be specific with file paths and line numbers if mentioned in revision request
-            3. Reference the previous implementation when suggesting changes
-            4. If revision request is unclear, make reasonable assumptions and document them
+            1. Read the codebase first to understand existing implementation
+            2. Output the COMPLETE plan with FULL CODE EXAMPLES
+            3. Be specific with file paths
+            4. Reference the previous implementation when suggesting changes
             5. Keep changes minimal - only address what was requested
-          effort: "high"
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 30
+            --model claude-opus-4-5-20251101
 
       - name: Save revision plan
         run: |
           mkdir -p .artifacts
           cat > .artifacts/REVISION_PLAN.md << 'EOF'
-          ${{ steps.codex.outputs.final-message }}
+          ${{ steps.opus-plan.outputs.response }}
           EOF
 
       - name: Upload revision plan artifact
@@ -179,17 +203,20 @@ jobs:
           name: revision-plan
           path: .artifacts/REVISION_PLAN.md
 
-  claude-implement-revision:
+  gemini-implement-revision:
     runs-on: ubuntu-latest
-    needs: codex-revision-plan
+    needs: opus-revision-plan
     permissions:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for better git context
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -255,98 +282,219 @@ jobs:
             echo "✅ Image context built successfully"
           fi
 
-      - name: Claude Code - implement revision
-        uses: anthropics/claude-code-action@v1
+      - name: Setup Git
+        run: |
+          git config user.name "Azmi Bot"
+          git config user.email "azmi-bot@users.noreply.github.com"
+
+      - name: Create revision branch
+        id: branch
+        run: |
+          ISSUE_KEY="${{ steps.payload.outputs.issue_key || 'ai-revision' }}"
+          BRANCH_NAME="revision/${ISSUE_KEY}"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Created branch: $BRANCH_NAME"
+
+      - name: Gemini 3 Pro - implement revision from plan
+        id: gemini-implement
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🚀 Starting Gemini 3 Pro revision implementation..."
+
+          # Read the plan
+          PLAN=$(cat .artifacts/REVISION_PLAN.md)
+          PREVIOUS_PR="${{ steps.payload.outputs.previous_pr_number }}"
+
+          # Build the implementation prompt
+          cat > .artifacts/revision-prompt.txt << 'PROMPT_EOF'
+          You are a senior software engineer implementing code revisions based on a detailed plan.
+
+          TASK: Implement the revision changes described in the plan below.
+
+          IMPORTANT OUTPUT FORMAT:
+          You must output a JSON object with this exact structure:
+          {
+            "files": [
+              {
+                "path": "relative/path/to/file.ts",
+                "action": "create" | "modify" | "delete",
+                "content": "full file content here"
+              }
+            ],
+            "commit_message": "descriptive commit message for the revision",
+            "pr_body": "markdown description of changes made"
+          }
+
+          RULES:
+          1. For "create" action: provide the complete new file content
+          2. For "modify" action: provide the COMPLETE file content (not just changes)
+          3. For "delete" action: content can be empty
+          4. Follow the revision plan exactly - implement only what was requested
+          5. Make minimal, surgical changes - do not refactor unrelated code
+          6. Use TypeScript/JavaScript best practices
+          7. Include proper error handling
+
+          REVISION PLAN:
+          ---
+          PROMPT_EOF
+
+          echo "$PLAN" >> .artifacts/revision-prompt.txt
+
+          if [ -n "$PREVIOUS_PR" ]; then
+            echo "" >> .artifacts/revision-prompt.txt
+            echo "PREVIOUS PR: #$PREVIOUS_PR" >> .artifacts/revision-prompt.txt
+          fi
+
+          # Build Gemini request
+          jq -n \
+            --rawfile prompt .artifacts/revision-prompt.txt \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{text: $prompt}]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.2,
+                maxOutputTokens: 65536
+              }
+            }' > .artifacts/gemini-revision-request.json
+
+          echo "📤 Sending revision request to Gemini 3 Pro..."
+
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/gemini-revision-request.json > .artifacts/gemini-response.json
+
+          echo "📥 Response received"
+
+          # Extract the JSON response
+          RESPONSE_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/gemini-response.json)
+          echo "$RESPONSE_TEXT" > .artifacts/revision-implementation.json
+
+          echo "✅ Revision implementation parsed"
+
+      - name: Apply revision changes
+        id: apply-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📝 Applying revision changes..."
+
+          # Parse the implementation JSON
+          IMPL_JSON=$(cat .artifacts/revision-implementation.json)
+
+          # Process each file
+          echo "$IMPL_JSON" | jq -c '.files[]' | while IFS= read -r file; do
+            FILE_PATH=$(echo "$file" | jq -r '.path')
+            ACTION=$(echo "$file" | jq -r '.action')
+            CONTENT=$(echo "$file" | jq -r '.content')
+
+            echo "Processing: $FILE_PATH ($ACTION)"
+
+            case "$ACTION" in
+              "create"|"modify")
+                mkdir -p "$(dirname "$FILE_PATH")"
+                echo "$CONTENT" > "$FILE_PATH"
+                echo "✅ Written: $FILE_PATH"
+                ;;
+              "delete")
+                if [ -f "$FILE_PATH" ]; then
+                  rm "$FILE_PATH"
+                  echo "🗑️  Deleted: $FILE_PATH"
+                fi
+                ;;
+            esac
+          done
+
+          # Extract commit message and PR body
+          echo "$IMPL_JSON" | jq -r '.commit_message' > .artifacts/commit-message.txt
+          echo "$IMPL_JSON" | jq -r '.pr_body' > .artifacts/pr-body.txt
+
+          echo "✅ All revision changes applied"
+
+      - name: Commit and push changes
+        id: commit
+        run: |
+          ISSUE_KEY="${{ steps.payload.outputs.issue_key || 'ai-revision' }}"
+          BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
+
+          # Check if there are changes
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "⚠️  No changes to commit"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git add -A
+
+          # Use commit message from Gemini or default
+          if [ -f .artifacts/commit-message.txt ]; then
+            COMMIT_MSG=$(cat .artifacts/commit-message.txt)
+          else
+            COMMIT_MSG="Revision: ${ISSUE_KEY}"
+          fi
+
+          git commit -m "$COMMIT_MSG
+
+          🤖 Implemented by Gemini 3 Pro
+          📋 Planned by Claude Opus 4.5"
+
+          git push -u origin "$BRANCH_NAME"
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "✅ Revision changes committed and pushed to $BRANCH_NAME"
+
+      - name: Create Pull Request
+        if: steps.commit.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GH_PAT }}
-          show_full_output: true
-          prompt: |
-            You are Claude Code working on ${{ github.repository }}.
+        run: |
+          ISSUE_KEY="${{ steps.payload.outputs.issue_key || 'ai-revision' }}"
+          BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
+          PREVIOUS_PR="${{ steps.payload.outputs.previous_pr_number }}"
 
-            CONTEXT:
-            - Repository: Win Room v2.0 - Next.js 14 + PostgreSQL + Socket.IO sales platform
-            - Architecture documented in TSD.md
-            - Task: ${{ github.event.client_payload.issue_key || 'Revision' }}
-            - Previous PR: #${{ steps.payload.outputs.previous_pr_number }}
+          # Build PR body
+          if [ -f .artifacts/pr-body.txt ]; then
+            PR_DESCRIPTION=$(cat .artifacts/pr-body.txt)
+          else
+            PR_DESCRIPTION="Revision implementation for ${ISSUE_KEY}"
+          fi
 
-            ${{ steps.image-context.outputs.context || '' }}
+          # Read the plan for PR body
+          PLAN=$(cat .artifacts/REVISION_PLAN.md)
 
-            ⚠️ CRITICAL - PRIMARY DIRECTIVE ⚠️
-            The user has provided a REVISION REQUEST. This is your PRIMARY directive.
-            You MUST follow the revision request EXACTLY as written. The Codex plan below is a suggestion,
-            but if it conflicts with the revision request, ALWAYS follow the revision request.
+          PR_BODY="## 🔄 AZMI Revision - ${ISSUE_KEY}
 
-            REVISION PLAN FROM CODEX (secondary guidance):
-            ---
-            ${{ steps.read-plan.outputs.plan }}
-            ---
+          ### Previous PR
+          ${PREVIOUS_PR:+#$PREVIOUS_PR}${PREVIOUS_PR:-N/A}
 
-            YOUR WORKFLOW:
+          ### Revision Plan (by Claude Opus 4.5)
+          <details>
+          <summary>Click to expand plan</summary>
 
-            1. UNDERSTAND THE CONTEXT:
-               - **PRIMARY**: Read the Codex revision plan above - it contains the USER'S REVISION REQUEST
-               - If previous PR number is provided, examine those changes: `gh pr view ${{ steps.payload.outputs.previous_pr_number }} --json files,diff`
-               - Understand what was implemented before and what needs to change
-               - If images are provided, study them carefully for visual bugs/requirements
+          ${PLAN}
 
-            2. VALIDATE THE REVISION PLAN:
-               - **PRIMARY**: Ensure you understand the USER'S EXACT REQUEST from the Codex plan
-               - Check if the requested changes make sense
-               - Verify files mentioned in the plan exist
-               - Identify any missing context or dependencies
-               - Create your "Final Revision Plan" that EXACTLY addresses the user's request
-               - Do not ask for approval. Automatically proceed with all file operations.
+          </details>
 
-            3. IMPLEMENT THE REVISIONS:
-               - **CRITICAL**: Follow the user's revision request EXACTLY - do not add extra features
-               - Make minimal, surgical changes - ONLY what was explicitly requested
-               - If user says "use Bootstrap class X", use that class, don't write custom CSS
-               - If user says "fix bug Y", fix ONLY that bug, don't refactor unrelated code
-               - Ensure code follows existing patterns
-               - Add appropriate error handling
-               - Update types/interfaces as needed
-               - Do not ask for approval. Automatically proceed.
+          ### Changes Made (by Gemini 3 Pro)
+          ${PR_DESCRIPTION}
 
-            4. UPDATE/ADD TESTS:
-               - Update existing tests if behavior changed
-               - Add new tests for new functionality
-               - Ensure all tests pass
+          ---
+          🧠 **Planned by:** Claude Opus 4.5
+          ⚡ **Implemented by:** Gemini 3 Pro
+          "
 
-            5. COMMIT AND PUSH:
-               - Create revision branch: `git checkout -b revision/${{ github.event.client_payload.issue_key || 'ai-revision' }}`
-               - Stage changes: `git add -A`
-               - Commit: `git commit -m "Revision: ${{ github.event.client_payload.issue_key || 'revision' }}"`
-               - Push: `git push -u origin revision/${{ github.event.client_payload.issue_key || 'ai-revision' }}`
+          # Create PR
+          gh pr create \
+            --title "AZMI Revision - ${ISSUE_KEY}" \
+            --body "$PR_BODY" \
+            --base "${{ env.BASE_BRANCH }}" \
+            --head "$BRANCH_NAME"
 
-            6. CREATE PULL REQUEST:
-               - Use: `gh pr create --title "..." --body "..." --base ${{ env.BASE_BRANCH }}`
-               - PR Title: "AZMI Revision - ${{ github.event.client_payload.issue_key || 'Task' }}"
-               - PR Body must include:
-                 * **Revision Request** (what was asked to change)
-                 * **Previous PR** (link to #${{ steps.payload.outputs.previous_pr_number }})
-                 * **Final Revision Plan** (your validated plan)
-                 * **Changes Made** (bullet list of files changed and why)
-                 * **Testing Done** (what tests were updated/added)
-               - CRITICAL: You MUST create the PR automatically.
-               - Do not ask for approval.
-
-            IMPORTANT RULES:
-            - Make surgical, minimal changes - don't refactor unrelated code
-            - Reference previous PR to understand context
-            - Always create a PR - the PR is the deliverable
-            - Run build/lint commands before pushing
-            - If revision request is ambiguous, make best judgment and document assumptions in PR
-
-            CRITICAL: You are running in CI/CD environment. DO NOT ASK FOR APPROVAL.
-            Automatically proceed with all file operations, git commands, and implementations.
-            No human is available to approve - execute all changes autonomously.
-
-            BEGIN REVISION IMPLEMENTATION NOW.
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 100
-            --model claude-sonnet-4-5-20250929
+          echo "✅ Revision Pull Request created"

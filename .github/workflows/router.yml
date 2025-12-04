@@ -11,7 +11,7 @@ jobs:
   quality_and_route:
     runs-on: ubuntu-latest
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       JIRA_BASE: ${{ secrets.JIRA_BASE }}
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
@@ -100,7 +100,7 @@ jobs:
           }
           JSON
 
-      - name: Score with OpenAI Structured Outputs (with vision)
+      - name: Score with Gemini 3 Pro Structured Outputs (with vision)
         id: ai
         shell: bash
         run: |
@@ -119,75 +119,91 @@ jobs:
             echo "📝 No images attached, proceeding with text-only evaluation"
           fi
 
-          # 3) Şemayı dosyadan oku ve tek satır JSON yap
+          # 3) Şemayı dosyadan oku
           SCHEMA=$(jq -c . .artifacts/quality.schema.json)
 
           # 4) Build prompt - different versions for with/without images
           if [ -f .artifacts/images.json ] && [ "$(jq -r '.count' .artifacts/images.json)" -gt 0 ]; then
-            # Prompt WITH images - asks AI to describe what it sees
-            FULL_INPUT="## IMAGE ANALYSIS REQUIRED\n\nBefore evaluating the ticket, first describe what you see in the attached image(s):\n- What UI elements, components, or screens are shown?\n- What specific changes or features are highlighted?\n- Are there annotations, arrows, or markings indicating something?\n\nThen evaluate the ticket using this visual context.\n\n---\n\nYou are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria (OR clear visual spec in images)\n- If images show the desired outcome, the visual spec can substitute for detailed text description\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nIMPORTANT: If the attached image clearly shows WHAT needs to be done (mockup, wireframe, before/after comparison), give significant credit. A clear visual specification can boost the score by 20-30 points. However, still check if critical context is missing (which page/component, exact colors/spacing if not obvious from image).\n\nOutput only JSON that matches the provided schema."
+            # Prompt WITH images
+            FULL_INPUT="## IMAGE ANALYSIS REQUIRED\n\nBefore evaluating the ticket, first describe what you see in the attached image(s):\n- What UI elements, components, or screens are shown?\n- What specific changes or features are highlighted?\n- Are there annotations, arrows, or markings indicating something?\n\nThen evaluate the ticket using this visual context.\n\n---\n\nYou are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria (OR clear visual spec in images)\n- If images show the desired outcome, the visual spec can substitute for detailed text description\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nIMPORTANT: If the attached image clearly shows WHAT needs to be done (mockup, wireframe, before/after comparison), give significant credit. A clear visual specification can boost the score by 20-30 points. However, still check if critical context is missing (which page/component, exact colors/spacing if not obvious from image).\n\nOutput only valid JSON."
           else
-            # Prompt WITHOUT images - standard text-only evaluation
-            FULL_INPUT="You are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nOutput only JSON that matches the provided schema."
+            # Prompt WITHOUT images
+            FULL_INPUT="You are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nOutput only valid JSON."
           fi
 
-          # 5) Build structured input for OpenAI (with vision support)
+          # Write prompt to file
+          echo -n "$FULL_INPUT" > .artifacts/prompt-text.txt
+
+          # 5) Build Gemini API request
           if [ -f .artifacts/images.json ] && [ "$(jq -r '.count' .artifacts/images.json)" -gt 0 ]; then
-            # Has images - build structured input array with text + images
-            echo "🖼️  Building structured input with $(jq -r '.count' .artifacts/images.json) image(s)"
+            # Has images - build multimodal request
+            echo "🖼️  Building multimodal request with $(jq -r '.count' .artifacts/images.json) image(s)"
 
-            # Write text input to file
-            echo -n "$FULL_INPUT" > .artifacts/prompt-text.txt
-
-            # Start with text content (file-based)
+            # Start building parts array with text
             jq -n --rawfile text .artifacts/prompt-text.txt \
-              '[{type: "input_text", text: $text}]' > .artifacts/input-array.json
+              '[{text: $text}]' > .artifacts/parts-array.json
 
-            # Add each image as input_image (file-based processing)
+            # Add each image as inline_data
             IMAGE_INDEX=0
             jq -c '.images[]' .artifacts/images.json | while IFS= read -r image; do
               IMAGE_INDEX=$((IMAGE_INDEX + 1))
 
-              # Extract data_uri to file
-              echo "$image" | jq -r '.data_uri' > .artifacts/data-uri-${IMAGE_INDEX}.txt
+              # Extract base64 data (remove data:image/...;base64, prefix)
+              echo "$image" | jq -r '.data_uri' | sed 's/data:image\/[^;]*;base64,//' > .artifacts/image-b64-${IMAGE_INDEX}.txt
+              MIME_TYPE=$(echo "$image" | jq -r '.data_uri' | sed -n 's/data:\([^;]*\);base64,.*/\1/p')
 
-              # Update input array with new image
-              jq --rawfile uri .artifacts/data-uri-${IMAGE_INDEX}.txt \
-                '. += [{type: "input_image", image_url: $uri}]' \
-                .artifacts/input-array.json > .artifacts/input-array-tmp.json
+              # Add image part
+              jq --rawfile b64 .artifacts/image-b64-${IMAGE_INDEX}.txt \
+                --arg mime "$MIME_TYPE" \
+                '. += [{inline_data: {mime_type: $mime, data: $b64}}]' \
+                .artifacts/parts-array.json > .artifacts/parts-array-tmp.json
 
-              mv .artifacts/input-array-tmp.json .artifacts/input-array.json
+              mv .artifacts/parts-array-tmp.json .artifacts/parts-array.json
             done
 
-            # Build body with array input (file-based)
+            # Build full Gemini request
             jq -n \
-              --slurpfile input_array .artifacts/input-array.json \
-              --arg schema "$SCHEMA" \
-              '{model: "gpt-5", input: [{role: "user", content: $input_array[0]}], reasoning: {effort: "low"}, text: {format: {type: "json_schema", name: "quality", schema: ($schema | fromjson), strict: true}}}' \
-              > .artifacts/openai-request.json
+              --slurpfile parts .artifacts/parts-array.json \
+              --argjson schema "$SCHEMA" \
+              '{
+                contents: [{
+                  role: "user",
+                  parts: $parts[0]
+                }],
+                generationConfig: {
+                  responseMimeType: "application/json",
+                  responseSchema: $schema,
+                  temperature: 0.2
+                }
+              }' > .artifacts/gemini-request.json
           else
-            # No images - simple text input
-            echo "📝 Building text-only input"
+            # No images - text only request
+            echo "📝 Building text-only request"
 
-            # Write prompt to file
-            echo -n "$FULL_INPUT" > .artifacts/prompt-text.txt
-
-            # Build body (file-based)
             jq -n \
-              --rawfile input .artifacts/prompt-text.txt \
-              --arg schema "$SCHEMA" \
-              '{model: "gpt-5", input: $input, reasoning: {effort: "low"}, text: {format: {type: "json_schema", name: "quality", schema: ($schema | fromjson), strict: true}}}' \
-              > .artifacts/openai-request.json
+              --rawfile text .artifacts/prompt-text.txt \
+              --argjson schema "$SCHEMA" \
+              '{
+                contents: [{
+                  role: "user",
+                  parts: [{text: $text}]
+                }],
+                generationConfig: {
+                  responseMimeType: "application/json",
+                  responseSchema: $schema,
+                  temperature: 0.2
+                }
+              }' > .artifacts/gemini-request.json
           fi
 
-          # 6) OpenAI GPT-5'e gönder (file-based)
-          echo "📤 Sending request to OpenAI GPT-5..."
-          echo "Request size: $(wc -c < .artifacts/openai-request.json) bytes"
+          # 6) Send to Gemini 3 Pro
+          echo "📤 Sending request to Gemini 3 Pro..."
+          echo "Request size: $(wc -c < .artifacts/gemini-request.json) bytes"
 
-          curl -sS https://api.openai.com/v1/responses \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @.artifacts/openai-request.json > .artifacts/ai.json
+            -d @.artifacts/gemini-request.json > .artifacts/ai.json
 
           echo "📥 Response received"
           cat .artifacts/ai.json
@@ -199,8 +215,8 @@ jobs:
           ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
           TARGET_REPO=$(jq -r '.target_repo' <<< '${{ toJSON(github.event.client_payload) }}')
 
-          # GPT-5 returns JSON as text string in message type output
-          JSON_TEXT=$(jq -r '.output[] | select(.type == "message") | .content[0].text' .artifacts/ai.json)
+          # Gemini 3 Pro returns JSON in candidates[0].content.parts[0].text
+          JSON_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/ai.json)
 
           # Extract fields and save to files to avoid shell argument limits
           echo "$JSON_TEXT" | jq -r '.score' > .artifacts/jira-score.txt

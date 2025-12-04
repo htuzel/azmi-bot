@@ -7,7 +7,7 @@
 
 > **Inspired by Azmi Mengü's vision** about building an agent that takes Jira tickets, writes code, runs tests, deploys, and closes the ticket automatically.
 
-Azmi Bot is a GitHub Actions-based automation system that orchestrates AI agents (Codex & Claude Code) to transform Jira tickets into production code through a quality-gated, multi-repository workflow.
+Azmi Bot is a GitHub Actions-based automation system that orchestrates AI agents (**Claude Opus 4.5** for planning & **Gemini 3 Pro** for coding/review) to transform Jira tickets into production code through a quality-gated, multi-repository workflow.
 
 ## ⚡ Quick Start
 
@@ -24,11 +24,13 @@ Azmi Bot is a GitHub Actions-based automation system that orchestrates AI agents
 Jira Ticket (+ Images) → Quality Gate (Router) → Target Repo → TSD → Implementation → PR → Review → Merge → Deploy
 ```
 
-1. **Quality Gate**: AI scores Jira tickets (0-100) for clarity, completeness, and testability
+1. **Quality Gate**: Gemini 3 Pro scores Jira tickets (0-100) for clarity, completeness, and testability
    - ✨ **Vision Support**: AI can see and analyze attached images (mockups, screenshots, diagrams)
 2. **Routing**: Passes high-quality tickets to the appropriate repository
-3. **Implementation**: Codex plans with visual context, Claude Code implements matching designs
-4. **Automation**: PRs are auto-created, reviewed, and merged
+3. **Planning**: Claude Opus 4.5 creates detailed implementation plans (TSD)
+4. **Implementation**: Gemini 3 Pro implements code based on the plan
+5. **Review**: Gemini 3 Pro reviews PRs and auto-fixes issues
+6. **Automation**: PRs are auto-created, reviewed, and merged
 
 ## 🏗️ Architecture
 
@@ -36,16 +38,16 @@ Jira Ticket (+ Images) → Quality Gate (Router) → Target Repo → TSD → Imp
 
 #### 1. Router Repository (This Repo)
 - Receives Jira webhook triggers
-- Scores ticket quality with OpenAI Structured Outputs
+- Scores ticket quality with **Gemini 3 Pro** (Structured Outputs)
 - Updates Jira custom fields (score, verdict, comments)
 - Routes approved tickets to target repositories via `repository_dispatch`
 
 #### 2. Target Repositories (Your Service Repos)
 - Receive `ai-coding-task` events
 - Run 2-stage AI workflow:
-  - **Codex**: Creates Technical Specification Document (TSD)
-  - **Claude Code**: Reviews TSD, implements code, opens PR
-- Auto-merge after Codex review
+  - **Claude Opus 4.5**: Creates Technical Specification Document (TSD) with full code examples
+  - **Gemini 3 Pro**: Implements code based on TSD, opens PR
+- Auto-merge after **Gemini 3 Pro** review
 
 #### 3. Jira Integration
 - Custom fields: `AI Quality Score`, `AI Quality Verdict`, `AI Target Repo`
@@ -253,8 +255,8 @@ This was a common issue before optimization. If you see this error:
 
 - Jira Cloud instance
 - GitHub organization with repos
-- OpenAI API key (GPT-4+)
-- Anthropic API key (Claude 3.5+)
+- Google AI API key (Gemini 3 Pro)
+- Anthropic API key (Claude Opus 4.5)
 
 ### 1. Setup Router Repository
 
@@ -271,7 +273,7 @@ Go to `Settings → Secrets and variables → Actions` and add:
 
 | Secret | Description | How to Get |
 |--------|-------------|------------|
-| `OPENAI_API_KEY` | OpenAI API key | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| `GEMINI_API_KEY` | Google AI API key | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `JIRA_BASE` | Your Jira URL | `https://yourcompany.atlassian.net` |
 | `JIRA_EMAIL` | Bot account email | Create a service account in Jira |
 | `JIRA_API_TOKEN` | Jira API token | [id.atlassian.com → Security → API tokens](https://id.atlassian.com/manage-profile/security/api-tokens) |
@@ -391,8 +393,8 @@ For each target repo (e.g., `win-room`, `api-service`):
 
 | Secret | Value | Description |
 |--------|-------|-------------|
-| `OPENAI_API_KEY` | Same as router | For Codex planning and review |
-| `ANTHROPIC_API_KEY` | From [console.anthropic.com](https://console.anthropic.com) | For Claude Code implementation |
+| `GEMINI_API_KEY` | Same as router | For Gemini 3 Pro coding and review |
+| `ANTHROPIC_API_KEY` | From [console.anthropic.com](https://console.anthropic.com) | For Claude Opus 4.5 planning |
 | `JIRA_BASE` | Same as router | `https://yourcompany.atlassian.net` |
 | `JIRA_EMAIL` | Same as router | Bot account email |
 | `JIRA_API_TOKEN` | Same as router | Jira API token |
@@ -964,23 +966,21 @@ Create `CLAUDE.md` in the root of each target repo:
    └─ Sends webhook to Router repo
 
 3. Router Repository
-   ├─ Scores ticket with AI (0-100)
+   ├─ Gemini 3 Pro scores ticket (0-100)
    ├─ Updates Jira fields
    ├─ Posts suggestions as comment
    └─ If score >= 80:
        └─ Sends repository_dispatch to target repo
 
 4. Target Repository
-   ├─ Codex creates TSD (Technical Spec)
-   ├─ Claude Code reviews TSD
-   ├─ Claude Code implements code
-   ├─ Claude Code opens PR
-   └─ Triggers Codex Review workflow
+   ├─ Claude Opus 4.5 creates TSD (Technical Spec + Code Examples)
+   ├─ Gemini 3 Pro implements code from TSD
+   ├─ Gemini 3 Pro opens PR
+   └─ Triggers Gemini Review workflow
 
 5. Code Review Workflow
-   ├─ Codex reviews PR
+   ├─ Gemini 3 Pro reviews PR
    ├─ If issues: Creates patch → Applies → Commits
-   ├─ Claude Code secondary review
    ├─ Posts to Jira with PR link
    ├─ Moves Jira to "Review" status
    └─ If approved: Auto-merges PR
@@ -1242,8 +1242,8 @@ MIT License - See LICENSE file
 ## 🙏 Credits
 
 - Inspired by Azmi Mengü's vision of AI agents that code, test, and deploy
-- Built with [OpenAI Codex](https://openai.com/index/openai-codex/)
-- Powered by [Claude Code](https://www.anthropic.com/claude/code)
+- Planning powered by [Claude Opus 4.5](https://www.anthropic.com/claude)
+- Coding & Review powered by [Google Gemini 3 Pro](https://ai.google.dev/)
 - Orchestrated with [GitHub Actions](https://github.com/features/actions)
 
 ---

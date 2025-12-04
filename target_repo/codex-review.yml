@@ -1,4 +1,4 @@
-name: Codex Review and Merge
+name: Gemini Review and Merge
 
 on:
   pull_request:
@@ -37,11 +37,12 @@ jobs:
             echo "PR Title: $TITLE"
           fi
 
-  codex-review:
+  gemini-review:
     runs-on: ubuntu-latest
     needs: check-ai-coding
     if: needs.check-ai-coding.outputs.should_run == 'true'
     env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       JIRA_BASE: ${{ secrets.JIRA_BASE }}
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
@@ -100,110 +101,139 @@ jobs:
           echo "issue_key=$ISSUE_KEY" >> $GITHUB_OUTPUT
           echo "Found Jira issue: $ISSUE_KEY"
 
-      - name: Codex - review PR and generate patch if needed
-        id: codex
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt: |
-            You are a senior code reviewer. Review ONLY the changes in this PR for ${{ github.repository }}.
+      - name: Get PR diff for review
+        id: get-diff
+        run: |
+          mkdir -p .artifacts
 
-            **YOUR TASK:**
-            1. Evaluate code quality and score 0-100
-            2. Identify issues (security, performance, logic, quality)
-            3. If there are BLOCKING issues, generate a unified diff patch to fix them
+          # Get the diff between base and head
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > .artifacts/pr.diff
 
-            **SCORING CRITERIA:**
-            - 85-100: Excellent - ready to merge
-            - 70-84: Good - minor issues acceptable
-            - 50-69: Fair - needs improvement
-            - 0-49: Poor - requires major revision
+          # Get list of changed files
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD > .artifacts/changed-files.txt
 
-            **DEDUCTIONS:**
-            - Security vulnerabilities: -30 points
-            - Logic errors: -20 points
-            - Performance issues: -10 points
-            - Code quality issues: -5 points
-            - Missing tests: -10 points
+          echo "📄 Changed files:"
+          cat .artifacts/changed-files.txt
 
-            **OUTPUT FORMAT (IMPORTANT: DO NOT USE MARKDOWN CODE BLOCKS):**
-            If there are blocking issues that you can fix automatically, output in PLAIN TEXT:
+          echo "diff_size=$(wc -l < .artifacts/pr.diff)" >> $GITHUB_OUTPUT
 
-            Score: [number]
-            Verdict: request_changes
-            Issues:
-            - [issue 1]
-            - [issue 2]
+      - name: Gemini 3 Pro - review PR and generate patch if needed
+        id: gemini-review
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            === BEGIN PATCH ===
-            [unified diff patch here - use proper diff format with --- and +++ headers]
-            === END PATCH ===
+          echo "🔍 Starting Gemini 3 Pro code review..."
 
-            If no blocking issues or you cannot create an automatic fix, output in PLAIN TEXT:
+          # Read the diff
+          DIFF=$(cat .artifacts/pr.diff)
+          CHANGED_FILES=$(cat .artifacts/changed-files.txt)
 
-            Score: [number]
-            Verdict: approve
-            Issues:
-            - [issue 1 if any]
-            - [issue 2 if any]
+          # Build the review prompt
+          cat > .artifacts/review-prompt.txt << 'PROMPT_EOF'
+          You are a senior code reviewer. Review ONLY the changes in this PR.
 
-            **IMPORTANT**:
-            - Patch should be a valid unified diff that can be applied with `git apply`
-            - Only create patches for blocking issues you can fix confidently
-            - Score > 80 should generally pass without patches unless critical security issues exist
-          effort: "high"
+          YOUR TASK:
+          1. Evaluate code quality and score 0-100
+          2. Identify issues (security, performance, logic, quality)
+          3. If there are BLOCKING issues, generate a unified diff patch to fix them
 
-      - name: Parse Codex review result
+          SCORING CRITERIA:
+          - 85-100: Excellent - ready to merge
+          - 70-84: Good - minor issues acceptable
+          - 50-69: Fair - needs improvement
+          - 0-49: Poor - requires major revision
+
+          DEDUCTIONS:
+          - Security vulnerabilities: -30 points
+          - Logic errors: -20 points
+          - Performance issues: -10 points
+          - Code quality issues: -5 points
+          - Missing tests: -10 points
+
+          OUTPUT FORMAT (JSON):
+          {
+            "score": <number 0-100>,
+            "verdict": "approve" | "request_changes",
+            "issues": ["issue 1", "issue 2"],
+            "patch": "<unified diff patch if needed, empty string if not>"
+          }
+
+          IMPORTANT:
+          - Patch should be a valid unified diff that can be applied with `git apply`
+          - Only create patches for blocking issues you can fix confidently
+          - Score > 80 should generally pass without patches unless critical security issues exist
+
+          CHANGED FILES:
+          PROMPT_EOF
+
+          echo "$CHANGED_FILES" >> .artifacts/review-prompt.txt
+          echo "" >> .artifacts/review-prompt.txt
+          echo "DIFF:" >> .artifacts/review-prompt.txt
+          echo '```diff' >> .artifacts/review-prompt.txt
+          echo "$DIFF" >> .artifacts/review-prompt.txt
+          echo '```' >> .artifacts/review-prompt.txt
+
+          # Build Gemini request
+          jq -n \
+            --rawfile prompt .artifacts/review-prompt.txt \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{text: $prompt}]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.2,
+                maxOutputTokens: 32768
+              }
+            }' > .artifacts/gemini-review-request.json
+
+          echo "📤 Sending review request to Gemini 3 Pro..."
+
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/gemini-review-request.json > .artifacts/gemini-review-response.json
+
+          echo "📥 Review response received"
+
+          # Extract the JSON response
+          RESPONSE_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/gemini-review-response.json)
+          echo "$RESPONSE_TEXT" > .artifacts/review-result.json
+
+          echo "✅ Review complete"
+
+      - name: Parse Gemini review result
         id: parse-review
         run: |
           set -e
 
-          # Parse text response from Codex
-          RESPONSE='${{ steps.codex.outputs.final-message }}'
-          echo "$RESPONSE" > .artifacts/codex_review.txt
+          echo "📊 Parsing Gemini review result..."
 
-          # Extract score (handles both plain text and markdown formats)
-          # First try plain text format
-          SCORE=$(echo "$RESPONSE" | grep -iE "^\s*Score:\s*" | head -1 | sed 's/.*Score:\s*//i' | sed 's/[^0-9].*//' || echo "")
+          # Parse JSON response from Gemini
+          REVIEW_JSON=$(cat .artifacts/review-result.json)
 
-          # If empty, try without anchoring to beginning
-          if [ -z "$SCORE" ]; then
-            SCORE=$(echo "$RESPONSE" | grep -i "Score:" | head -1 | sed 's/.*Score:\s*//i' | sed 's/[^0-9].*//' || echo "0")
-          fi
+          # Extract fields from JSON
+          SCORE=$(echo "$REVIEW_JSON" | jq -r '.score // 0')
+          VERDICT=$(echo "$REVIEW_JSON" | jq -r '.verdict // "request_changes"')
+          ISSUES=$(echo "$REVIEW_JSON" | jq -r '.issues | join("\n- ")' || echo "No issues found")
+          PATCH=$(echo "$REVIEW_JSON" | jq -r '.patch // ""')
 
-          # Validate score is a number, default to 0 if not
+          # Validate score is a number
           if ! [[ "$SCORE" =~ ^[0-9]+$ ]] || [ -z "$SCORE" ]; then
-            echo "⚠️ Warning: Could not parse score from Codex response, defaulting to 0"
-            echo "Response excerpt: $(echo "$RESPONSE" | head -5)"
+            echo "⚠️ Warning: Invalid score, defaulting to 0"
             SCORE=0
           fi
 
-          # Extract verdict (handles both plain text and markdown)
-          VERDICT=$(echo "$RESPONSE" | grep -iE "^\s*Verdict:\s*" | head -1 | sed 's/.*Verdict:\s*//i' | sed 's/\s*$//' || echo "")
-
-          # If empty, try without anchoring
-          if [ -z "$VERDICT" ]; then
-            VERDICT=$(echo "$RESPONSE" | grep -i "Verdict:" | head -1 | sed 's/.*Verdict:\s*//i' | sed 's/\s*$//' || echo "Needs Review")
-          fi
-
-          # Validate verdict is not empty
-          if [ -z "$VERDICT" ]; then
-            VERDICT="Needs Review"
-          fi
-
-          # Extract issues (lines starting with -)
-          ISSUES=$(echo "$RESPONSE" | sed -n '/^Issues:/,/^=== BEGIN PATCH ===/p' | grep "^-" | sed 's/^- //' || echo "No issues found")
+          echo "Score: $SCORE"
+          echo "Verdict: $VERDICT"
 
           # Check if patch exists
-          if echo "$RESPONSE" | grep -q "^=== BEGIN PATCH ==="; then
+          if [ -n "$PATCH" ] && [ "$PATCH" != "null" ] && [ "$PATCH" != "" ]; then
             echo "has_patch=true" >> $GITHUB_OUTPUT
-
-            # Extract patch
-            mkdir -p .artifacts
-            echo "$RESPONSE" | sed -n '/^=== BEGIN PATCH ===/,/^=== END PATCH ===/p' | \
-              grep -v "^===" > .artifacts/codex.patch
-
-            echo "📝 Patch extracted to .artifacts/codex.patch"
+            echo "$PATCH" > .artifacts/gemini.patch
+            echo "📝 Patch extracted to .artifacts/gemini.patch"
           else
             echo "has_patch=false" >> $GITHUB_OUTPUT
             echo "✅ No patch needed"
@@ -212,12 +242,12 @@ jobs:
           echo "score=$SCORE" >> $GITHUB_OUTPUT
           echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
 
-          # Save issues to file for Claude Code (multi-line safe)
+          # Save issues (multi-line safe)
           echo "issues<<EOF" >> $GITHUB_OUTPUT
           echo "$ISSUES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Determine if PR should proceed (score > 80 per ARTICLE.md)
+          # Determine if PR should proceed (score > 80)
           if [ "$SCORE" -gt 80 ]; then
             echo "should_proceed=true" >> $GITHUB_OUTPUT
             echo "✅ Score: $SCORE - PR can proceed"
@@ -226,91 +256,144 @@ jobs:
             echo "❌ Score: $SCORE - PR needs revision"
           fi
 
-      - name: Apply Codex patch if exists
+      - name: Apply Gemini patch if exists
         if: steps.parse-review.outputs.has_patch == 'true'
         run: |
-          echo "🔧 Applying Codex patch..."
+          echo "🔧 Applying Gemini patch..."
 
           # Ensure we're on the correct branch
           git checkout -B ${{ github.event.pull_request.head.ref }}
           git branch --set-upstream-to=origin/${{ github.event.pull_request.head.ref }}
 
           # Apply patch with whitespace fixing
-          if git apply --whitespace=fix .artifacts/codex.patch; then
+          if git apply --whitespace=fix .artifacts/gemini.patch; then
             echo "✅ Patch applied successfully"
 
             # Commit the changes
-            git config user.name "GitHub Actions"
-            git config user.email "actions@github.com"
+            git config user.name "Azmi Bot"
+            git config user.email "azmi-bot@users.noreply.github.com"
             git add -A
-            git commit -m "Fix: Apply Codex review patch (Score: ${{ steps.parse-review.outputs.score }})"
+            git commit -m "Fix: Apply Gemini review patch (Score: ${{ steps.parse-review.outputs.score }})"
 
             # Push with explicit ref
             git push origin HEAD:${{ github.event.pull_request.head.ref }}
 
             echo "✅ Patch committed and pushed"
           else
-            echo "❌ Patch failed to apply - will be handled by Claude Code"
-            exit 0  # Don't fail the workflow, let Claude Code handle it
+            echo "❌ Patch failed to apply - will request manual fix"
+            exit 0
           fi
 
-      - name: Claude Code - evaluate and fix issues
-        if: steps.parse-review.outputs.issues != ''
-        id: claude-fix
-        uses: anthropics/claude-code-action@v1
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GH_PAT }}
-          show_full_output: true
-          prompt: |
-            You are Claude Code performing code review fixes on PR #${{ github.event.pull_request.number }}.
+      - name: Gemini 3 Pro - evaluate and fix remaining issues
+        if: steps.parse-review.outputs.issues != '' && steps.parse-review.outputs.should_proceed != 'true'
+        id: gemini-fix
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            **CONTEXT:**
-            - Repository: ${{ github.repository }}
-            - PR Branch: ${{ github.event.pull_request.head.ref }}
-            - Base Branch: ${{ github.event.pull_request.base.ref }}
-            - Codex Review Score: ${{ steps.parse-review.outputs.score }}/100
+          echo "🔧 Starting Gemini 3 Pro issue fixing..."
 
-            **CODEX REVIEW FINDINGS:**
-            ${{ steps.parse-review.outputs.issues }}
+          ISSUES='${{ steps.parse-review.outputs.issues }}'
+          SCORE='${{ steps.parse-review.outputs.score }}'
 
-            **YOUR TASK:**
-            1. **READ AND UNDERSTAND** the Codex findings above
-            2. **EXAMINE THE CODE** to verify each issue
-            3. **EVALUATE** each finding:
-               - Is this a real bug or false positive?
-               - Is it critical/high/medium/low severity?
-               - Should it be fixed now or is it acceptable?
-            4. **FIX ONLY WHAT'S NECESSARY**:
-               - Fix CRITICAL and HIGH severity issues immediately
-               - Fix MEDIUM severity if it's a quick fix
-               - Skip LOW severity or false positives
-            5. **COMMIT CHANGES** to the PR branch if you make any fixes
+          # Read current file contents for context
+          CHANGED_FILES=$(cat .artifacts/changed-files.txt)
 
-            **IMPORTANT RULES:**
-            - You are already on the PR branch (${{ github.event.pull_request.head.ref }})
-            - DO NOT create a new branch
-            - Make minimal, surgical fixes
-            - Each fix should address one specific Codex finding
-            - Use clear commit messages: "Fix: [issue description]"
-            - If no fixes needed, just explain why in your response
-            - DO NOT ask for approval - you're in CI/CD, execute autonomously
+          # Build the fix prompt
+          cat > .artifacts/fix-prompt.txt << PROMPT_EOF
+          You are a senior software engineer fixing code review issues.
 
-            **COMMIT WORKFLOW (if fixes needed):**
-            ```bash
+          CONTEXT:
+          - Repository: ${{ github.repository }}
+          - PR Branch: ${{ github.event.pull_request.head.ref }}
+          - Review Score: ${SCORE}/100
+
+          REVIEW FINDINGS TO FIX:
+          ${ISSUES}
+
+          CHANGED FILES:
+          ${CHANGED_FILES}
+
+          YOUR TASK:
+          1. Analyze each issue
+          2. For CRITICAL and HIGH severity issues, generate fixes
+          3. Skip LOW severity or false positives
+
+          OUTPUT FORMAT (JSON):
+          {
+            "fixes_applied": true | false,
+            "files": [
+              {
+                "path": "relative/path/to/file.ts",
+                "content": "complete fixed file content"
+              }
+            ],
+            "summary": "description of fixes applied"
+          }
+
+          IMPORTANT:
+          - Only fix issues that are clearly bugs or security problems
+          - Provide COMPLETE file content, not just patches
+          - If no fixes needed, set fixes_applied to false
+          PROMPT_EOF
+
+          # Build Gemini request
+          jq -n \
+            --rawfile prompt .artifacts/fix-prompt.txt \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{text: $prompt}]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.2,
+                maxOutputTokens: 65536
+              }
+            }' > .artifacts/gemini-fix-request.json
+
+          echo "📤 Sending fix request to Gemini 3 Pro..."
+
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/gemini-fix-request.json > .artifacts/gemini-fix-response.json
+
+          # Extract and apply fixes
+          RESPONSE_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/gemini-fix-response.json)
+          echo "$RESPONSE_TEXT" > .artifacts/fix-result.json
+
+          FIXES_APPLIED=$(echo "$RESPONSE_TEXT" | jq -r '.fixes_applied')
+          SUMMARY=$(echo "$RESPONSE_TEXT" | jq -r '.summary // "No fixes applied"')
+
+          if [ "$FIXES_APPLIED" = "true" ]; then
+            echo "📝 Applying fixes..."
+
+            # Apply each file fix
+            echo "$RESPONSE_TEXT" | jq -c '.files[]' | while IFS= read -r file; do
+              FILE_PATH=$(echo "$file" | jq -r '.path')
+              CONTENT=$(echo "$file" | jq -r '.content')
+
+              mkdir -p "$(dirname "$FILE_PATH")"
+              echo "$CONTENT" > "$FILE_PATH"
+              echo "✅ Fixed: $FILE_PATH"
+            done
+
+            # Commit fixes
+            git config user.name "Azmi Bot"
+            git config user.email "azmi-bot@users.noreply.github.com"
             git add -A
-            git commit -m "AI Review Fixes: Address Codex findings (Score: ${{ steps.parse-review.outputs.score }})"
-            git push origin ${{ github.event.pull_request.head.ref }}
-            ```
+            git commit -m "AI Review Fixes: Address Gemini findings (Score: $SCORE)
 
-            BEGIN EVALUATION AND FIXES NOW.
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 50
-            --model claude-sonnet-4-5-20250929
+            $SUMMARY"
+            git push origin ${{ github.event.pull_request.head.ref }}
+
+            echo "✅ Fixes committed and pushed"
+          else
+            echo "ℹ️ No fixes needed: $SUMMARY"
+          fi
+
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
 
       - name: Post review summary as comment
         uses: actions/github-script@v7
@@ -318,29 +401,28 @@ jobs:
           script: |
             const score = '${{ steps.parse-review.outputs.score }}';
             const verdict = '${{ steps.parse-review.outputs.verdict }}';
-            // Use JSON.stringify to safely handle multi-line strings and special characters
             const issuesRaw = ${{ toJSON(steps.parse-review.outputs.issues) }};
-            const claudeFixRaw = ${{ toJSON(steps.claude-fix.outputs.response) }} || 'No fixes needed - issues were false positives or low severity';
+            const geminiFix = '${{ steps.gemini-fix.outputs.summary }}' || 'No fixes needed';
 
             const issues = issuesRaw || '';
-            const claudeFix = claudeFixRaw || 'No fixes needed - issues were false positives or low severity';
 
-            const codexSummary = issues ? '**Issues Found:**\n- ' + issues : '**No major issues found**';
+            const geminiSummary = issues ? '**Issues Found:**\n- ' + issues : '**No major issues found**';
 
             // Determine status emoji
             const statusEmoji = score >= 85 ? '✅' : score >= 70 ? '⚠️' : '❌';
 
             const body = '## ' + statusEmoji + ' AI Code Review Summary\n\n' +
-              '**Codex Score**: ' + score + '/100\n' +
+              '**Gemini 3 Pro Score**: ' + score + '/100\n' +
               '**Verdict**: ' + verdict + '\n\n' +
-              '### 📋 Codex Findings\n' +
-              codexSummary + '\n\n' +
+              '### 📋 Review Findings\n' +
+              geminiSummary + '\n\n' +
               '---\n\n' +
-              '### 🔧 Claude Code Evaluation & Fixes\n' +
-              claudeFix + '\n\n' +
+              '### 🔧 Auto-Fix Summary\n' +
+              geminiFix + '\n\n' +
               '---\n\n' +
               '**Next Steps:**\n' +
-              (score > 80 ? '✅ PR approved - will auto-merge if checks pass' : '❌ PR needs revision - score too low (threshold: 80)');
+              (score > 80 ? '✅ PR approved - will auto-merge if checks pass' : '❌ PR needs revision - score too low (threshold: 80)') + '\n\n' +
+              '---\n🤖 Reviewed by Gemini 3 Pro';
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -359,7 +441,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.payload.pull_request.number,
               event: "APPROVE",
-              body: `✅ LGTM - Codex Score: ${{ steps.parse-review.outputs.score }}/100 (threshold: 80)`
+              body: `✅ LGTM - Gemini 3 Pro Score: ${{ steps.parse-review.outputs.score }}/100 (threshold: 80)`
             });
 
       - name: Post review summary to Jira
@@ -379,7 +461,7 @@ jobs:
           echo -n "${{ steps.parse-review.outputs.score }}" > .artifacts/score.txt
           echo -n "${{ steps.parse-review.outputs.verdict }}" > .artifacts/verdict.txt
           echo -n "${{ steps.parse-review.outputs.issues }}" > .artifacts/issues.txt
-          echo -n "${{ steps.claude-fix.outputs.response }}" > .artifacts/claude_fix.txt
+          echo -n "${{ steps.gemini-fix.outputs.summary }}" > .artifacts/gemini_fix.txt
 
           SCORE=$(cat .artifacts/score.txt)
           AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
@@ -398,7 +480,7 @@ jobs:
             --rawfile score .artifacts/score.txt \
             --rawfile verdict .artifacts/verdict.txt \
             --rawfile issues .artifacts/issues.txt \
-            --rawfile claude_fix .artifacts/claude_fix.txt \
+            --rawfile gemini_fix .artifacts/gemini_fix.txt \
             '{
               body: {
                 type: "doc",
@@ -426,6 +508,13 @@ jobs:
                   {
                     type: "paragraph",
                     content: [
+                      { type: "text", text: "Reviewed by: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: "Gemini 3 Pro" }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
                       { type: "text", text: "Pull Request: ", marks: [{ type: "strong" }] },
                       { type: "text", text: $pr_url, marks: [{ type: "link", attrs: { href: $pr_url } }] }
                     ]
@@ -433,7 +522,7 @@ jobs:
                   {
                     type: "heading",
                     attrs: { level: 3 },
-                    content: [{ type: "text", text: "📋 Codex Findings:" }]
+                    content: [{ type: "text", text: "📋 Review Findings:" }]
                   },
                   {
                     type: "paragraph",
@@ -442,11 +531,11 @@ jobs:
                   {
                     type: "heading",
                     attrs: { level: 3 },
-                    content: [{ type: "text", text: "🔧 Claude Code Evaluation:" }]
+                    content: [{ type: "text", text: "🔧 Auto-Fix Summary:" }]
                   },
                   {
                     type: "paragraph",
-                    content: [{ type: "text", text: ($claude_fix | if . == "" then "No fixes applied - issues were false positives or low severity" else . end) }]
+                    content: [{ type: "text", text: ($gemini_fix | if . == "" then "No fixes applied" else . end) }]
                   }
                 ]
               }
@@ -518,7 +607,7 @@ jobs:
                 pull_number: context.payload.pull_request.number,
                 merge_method: "squash",
                 commit_title: `${context.payload.pull_request.title} (#${context.payload.pull_request.number})`,
-                commit_message: `✅ Auto-merged after AI Review (Codex Score: ${score}/100)`
+                commit_message: `✅ Auto-merged after AI Review (Gemini 3 Pro Score: ${score}/100)`
               });
               core.info(`✅ Merged successfully: ${result.data.message}`);
             } catch (e) {
