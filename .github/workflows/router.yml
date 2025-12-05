@@ -89,14 +89,13 @@ jobs:
             "type": "object",
             "required": ["score","verdict","reasons","fix_suggestions","fixed_summary","fixed_description"],
             "properties": {
-              "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+              "score": { "type": "integer" },
               "verdict": { "type": "string", "enum": ["pass","fail"] },
               "reasons": { "type": "array", "items": { "type": "string" } },
               "fix_suggestions": { "type": "string" },
               "fixed_summary": { "type": "string" },
               "fixed_description": { "type": "string" }
-            },
-            "additionalProperties": false
+            }
           }
           JSON
 
@@ -148,12 +147,15 @@ jobs:
             jq -c '.images[]' .artifacts/images.json | while IFS= read -r image; do
               IMAGE_INDEX=$((IMAGE_INDEX + 1))
 
-              # Extract base64 data (remove data:image/...;base64, prefix)
-              echo "$image" | jq -r '.data_uri' | sed 's/data:image\/[^;]*;base64,//' > .artifacts/image-b64-${IMAGE_INDEX}.txt
+              # Extract base64 data (remove data:image/...;base64, prefix) and strip all newlines
+              echo "$image" | jq -r '.data_uri' | sed 's/data:image\/[^;]*;base64,//' | tr -d '\n\r' > .artifacts/image-b64-${IMAGE_INDEX}.txt
               MIME_TYPE=$(echo "$image" | jq -r '.data_uri' | sed -n 's/data:\([^;]*\);base64,.*/\1/p')
 
-              # Add image part
-              jq --rawfile b64 .artifacts/image-b64-${IMAGE_INDEX}.txt \
+              # Read base64 as arg (not rawfile) to avoid newline issues
+              B64_DATA=$(cat .artifacts/image-b64-${IMAGE_INDEX}.txt)
+
+              # Add image part using --arg to properly escape the data
+              jq --arg b64 "$B64_DATA" \
                 --arg mime "$MIME_TYPE" \
                 '. += [{inline_data: {mime_type: $mime, data: $b64}}]' \
                 .artifacts/parts-array.json > .artifacts/parts-array-tmp.json
