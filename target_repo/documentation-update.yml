@@ -1,0 +1,246 @@
+name: Documentation Update Agent
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master, develop]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  analyze-changes:
+    if: github.event.pull_request.merged == true && !startsWith(github.event.pull_request.head.ref, 'docs/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 2
+
+      - name: Get changed files and their content
+        id: changed-files
+        run: |
+          # Get list of files changed in the merge commit
+          CHANGED_FILES=$(git diff --name-only HEAD^1 HEAD)
+
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          mkdir -p .artifacts/changed_files
+
+          # Get content of each changed file
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              mkdir -p ".artifacts/changed_files/$(dirname "$file")"
+              head -n 100 "$file" > ".artifacts/changed_files/$file" 2>/dev/null || true
+            fi
+          done <<< "$CHANGED_FILES"
+
+      - name: Get documentation content
+        id: get-docs
+        run: |
+          mkdir -p .artifacts/docs
+          find docs -name "*.md" -type f 2>/dev/null | while read file; do
+            if [ -f "$file" ]; then
+              mkdir -p ".artifacts/docs/$(dirname "$file")"
+              head -n 100 "$file" > ".artifacts/docs/$file" 2>/dev/null || true
+            fi
+          done
+          for file in *.md; do
+            if [ -f "$file" ]; then
+              head -n 100 "$file" > ".artifacts/docs/$file" 2>/dev/null || true
+            fi
+          done
+
+      - name: Prepare Context
+        id: prepare-context
+        run: |
+          CHANGE_SUMMARY=""
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f ".artifacts/changed_files/$file" ]; then
+              CHANGE_SUMMARY+="\n\nFile: $file\n"
+              CHANGE_SUMMARY+="First 100 lines:\n\`\`\`\n$(cat ".artifacts/changed_files/$file")\n\`\`\`\n"
+            fi
+          done <<< "${{ steps.changed-files.outputs.changed_files }}"
+
+          DOC_SUMMARY=""
+          find .artifacts/docs -name "*.md" -type f 2>/dev/null | while read file; do
+            rel_path=${file#.artifacts/docs/}
+            DOC_SUMMARY+="\n\nDocument: $rel_path\n"
+            DOC_SUMMARY+="First 100 lines:\n\`\`\`\n$(cat "$file")\n\`\`\`\n"
+          done
+
+          echo "change_summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGE_SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "doc_summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$DOC_SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Documentation Plan
+        id: create-plan
+        uses: openai/openai-action@v1
+        with:
+          api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            You are a Senior Technical Writer and Documentation Planner for Flalingo.
+
+            CONTEXT:
+            - A PR has just been merged.
+            - We need to determine if the changes significantly affect a "flow" (business logic, user journey, system process).
+            - If a flow is modified, we must update the documentation.
+            - Small code changes or additions do not need to be documented.
+
+            INPUTS:
+            - CODE CHANGES: See below.
+            - EXISTING DOCUMENTATION: See below.
+
+            TASK:
+            1. Analyze the code changes.
+            2. Decide if a flow has been modified.
+            3. Create a detailed "Documentation Update Plan".
+
+            PLAN FORMAT (Markdown):
+
+            # Documentation Update Plan
+
+            ## Status
+            [REQUIRED / NOT_REQUIRED]
+
+            ## Analysis
+            [Brief explanation of why updates are or are not needed]
+
+            ## Changes Required (if Status is REQUIRED)
+            For each file to be created or updated:
+
+            ### File: `docs/<filename>.md`
+            **Action:** [Create / Update / Rewrite]
+            **Content Requirements:**
+            - **Purpose:** [What this flow does]
+            - **Scope:** [Boundaries of the flow]
+            - **Components:** [Modules involved]
+            - **Capabilities:** [What it can do]
+            - **Limitations:** [Constraints]
+            - **Developer Notes:** [Technical details]
+
+            CODE CHANGES:
+            ${{ steps.prepare-context.outputs.change_summary }}
+
+            EXISTING DOCUMENTATION:
+            ${{ steps.prepare-context.outputs.doc_summary }}
+
+      - name: Save Plan Artifact
+        run: |
+          mkdir -p .artifacts
+          echo "${{ steps.create-plan.outputs.completion }}" > .artifacts/DOC_PLAN.md
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: doc-plan
+          path: .artifacts/DOC_PLAN.md
+
+  agentic-update:
+    needs: analyze-changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: doc-plan
+          path: .artifacts
+
+      - name: Read Plan
+        id: read-plan
+        run: |
+          PLAN=$(cat .artifacts/DOC_PLAN.md)
+          echo "plan<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Execute Documentation Updates (Claude Code)
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
+          prompt: |
+            You are an Agentic Technical Writer for Flalingo.
+
+            CONTEXT:
+            - You are running in a CI/CD workflow after a PR merge.
+            - Your goal is to update the documentation based on the provided plan.
+
+            DOCUMENTATION PLAN:
+            ---
+            ${{ steps.read-plan.outputs.plan }}
+            ---
+
+            INSTRUCTIONS:
+            1. Read the "Documentation Update Plan" above.
+            2. Check the "Status".
+               - If Status is "NOT_REQUIRED", print "No updates needed" and exit.
+            3. If Status is "REQUIRED":
+               - Follow the "Changes Required" section.
+               - Create or update the specified Markdown files in the `docs/` directory.
+               - Ensure the content follows the structure: Purpose, Scope, Components, Capabilities, Limitations, Developer Notes.
+               - Write high-quality, clear English documentation.
+               - Do NOT include security or performance concerns unless critical.
+            4. Create Pull Request:
+               - Create a new branch: `docs/update-flow-${{ github.event.pull_request.number }}`
+               - Configure git user (Documentation Bot).
+               - Commit changes with message: "docs: Update flow documentation"
+               - Push the branch.
+               - Create a PR using `gh pr create`:
+                 - Title: "docs: Update flow documentation for PR #${{ github.event.pull_request.number }}"
+                 - Body: "Automated documentation updates based on changes in PR #${{ github.event.pull_request.number }}."
+                 - Base: ${{ github.event.pull_request.base.ref }}
+                 - Reviewer: ${{ github.event.pull_request.user.login }}
+
+            CRITICAL:
+            - You have permission to write to the repository.
+            - Execute the changes, push the branch, and create the PR.
+            - Do not ask for approval.
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 50
+            --model claude-sonnet-4-5-20250929
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const plan = `${{ steps.read-plan.outputs.plan }}`;
+            const isRequired = plan.includes('Status\nREQUIRED') || plan.includes('Status: REQUIRED');
+
+            let body = '';
+            if (isRequired) {
+              body = `## 📚 Documentation Update Initiated\n\nBased on the changes in this PR, a new Pull Request with documentation updates has been created and assigned to you for review.\n\n### Plan:\n\n${plan}`;
+            } else {
+              body = `## 📚 Documentation Analysis\n\nNo flow changes detected requiring documentation updates.\n\n### Analysis:\n\n${plan}`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body
+            });
