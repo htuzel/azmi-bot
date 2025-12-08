@@ -1,3 +1,23 @@
+# ==============================================================================
+# AI Coding Workflow - Gemini Plans, Claude Opus Implements
+# ==============================================================================
+# This workflow automates code implementation from Jira tickets using AI:
+# 1. Gemini 3 Pro creates a detailed implementation plan
+# 2. Claude Opus 4.5 evaluates, revises if needed, and implements the code
+#
+# Required Secrets:
+# - GEMINI_API_KEY: Google AI API key for Gemini
+# - ANTHROPIC_API_KEY: Anthropic API key for Claude
+# - GH_PAT: GitHub Personal Access Token with repo permissions
+# - JIRA_BASE: Jira instance URL (e.g., https://company.atlassian.net)
+# - JIRA_EMAIL: Jira account email
+# - JIRA_API_TOKEN: Jira API token
+#
+# Required Scripts (in .github/scripts/):
+# - fetch-jira-attachments.sh: Downloads and optimizes images from Jira
+# - build-image-context.sh: Prepares images for AI consumption
+# ==============================================================================
+
 name: AI Coding
 
 on:
@@ -10,17 +30,22 @@ permissions:
   issues: write
 
 env:
+  # CUSTOMIZE: Change to your default branch (main, master, develop, etc.)
   BASE_BRANCH: develop
 
 jobs:
-  opus-plan:
+  gemini-plan:
     runs-on: ubuntu-latest
     env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       JIRA_BASE: ${{ secrets.JIRA_BASE }}
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clean artifacts directory
+        run: rm -rf .artifacts && mkdir -p .artifacts
 
       - name: Extract issue_key from payload
         id: payload
@@ -42,9 +67,6 @@ jobs:
           fi
 
           echo "Fetching issue: $ISSUE from Jira..."
-          echo "JIRA_BASE: $JIRA_BASE"
-          echo "JIRA_EMAIL: $JIRA_EMAIL"
-          echo "Full URL: $JIRA_BASE/rest/api/3/issue/$ISSUE?expand=renderedFields"
 
           AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
 
@@ -57,240 +79,315 @@ jobs:
           echo "Issue fetched successfully"
 
           TITLE=$(jq -r '.fields.summary' .artifacts/jira-issue.json)
-          # Use renderedFields.description (HTML string) instead of fields.description (ADF JSON)
           DESCRIPTION=$(jq -r '.renderedFields.description // "No description"' .artifacts/jira-issue.json)
 
           echo "Title: $TITLE"
           echo "Description preview: ${DESCRIPTION:0:100}..."
 
-          # Multi-line output requires EOF delimiter in GitHub Actions
+          # Save to files for Gemini prompt
+          echo "$TITLE" > .artifacts/jira-title.txt
+          echo "$DESCRIPTION" > .artifacts/jira-description.txt
+
           echo "title=$TITLE" >> $GITHUB_OUTPUT
-          echo "description<<EOF" >> $GITHUB_OUTPUT
-          echo "$DESCRIPTION" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Install ImageMagick for image optimization
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
-          echo "✅ ImageMagick installed for PDF conversion and image optimization"
+          echo "✅ ImageMagick installed"
 
       - name: Fetch and optimize Jira images
         id: fetch-images
         run: |
           ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
 
-          # Fetch images from Jira (downloads, optimizes, base64 encodes)
           bash .github/scripts/fetch-jira-attachments.sh \
             "$JIRA_BASE" "$ISSUE" "$JIRA_EMAIL" "$JIRA_API_TOKEN"
 
-          # Check if images were fetched
           if [ -f .artifacts/images.json ]; then
-            IMAGE_COUNT=$(jq '. | length' .artifacts/images.json)
+            IMAGE_COUNT=$(jq '.count // (. | length)' .artifacts/images.json 2>/dev/null || echo "0")
             echo "image_count=$IMAGE_COUNT" >> $GITHUB_OUTPUT
             echo "has_images=true" >> $GITHUB_OUTPUT
-            echo "✅ Fetched and optimized $IMAGE_COUNT image(s)"
+            echo "✅ Fetched $IMAGE_COUNT image(s)"
           else
             echo "has_images=false" >> $GITHUB_OUTPUT
             echo "image_count=0" >> $GITHUB_OUTPUT
-            echo "ℹ️ No images attached to this ticket"
+            echo "ℹ️ No images attached"
           fi
 
-      - name: Build image context for AI
-        if: steps.fetch-images.outputs.has_images == 'true'
-        id: image-context
+      - name: Build docs context
+        id: docs-context
         run: |
-          # Build markdown with embedded images
-          bash .github/scripts/build-image-context.sh
+          # Create a summary of available documentation
+          # CUSTOMIZE: Adjust the docs path if your project uses a different location
+          echo "# Project Documentation" > .artifacts/docs-summary.txt
+          echo "" >> .artifacts/docs-summary.txt
 
-          # Read the generated context
-          if [ -f .artifacts/image-context.md ]; then
-            echo "context<<EOF" >> $GITHUB_OUTPUT
-            cat .artifacts/image-context.md >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            echo "✅ Image context built successfully"
+          # Try common documentation locations
+          for docs_dir in docs doc documentation; do
+            if [ -d "$docs_dir" ]; then
+              for doc in "$docs_dir"/*.md; do
+                if [ -f "$doc" ]; then
+                  echo "## $(basename "$doc" .md)" >> .artifacts/docs-summary.txt
+                  head -30 "$doc" >> .artifacts/docs-summary.txt
+                  echo "" >> .artifacts/docs-summary.txt
+                  echo "---" >> .artifacts/docs-summary.txt
+                  echo "" >> .artifacts/docs-summary.txt
+                fi
+              done
+            fi
+          done
+
+          # Also check for TSD.md, README.md, ARCHITECTURE.md at root
+          for doc in TSD.md README.md ARCHITECTURE.md CONTRIBUTING.md; do
+            if [ -f "$doc" ]; then
+              echo "## $doc" >> .artifacts/docs-summary.txt
+              head -50 "$doc" >> .artifacts/docs-summary.txt
+              echo "" >> .artifacts/docs-summary.txt
+              echo "---" >> .artifacts/docs-summary.txt
+            fi
+          done
+
+          echo "✅ Docs context built"
+
+      - name: Gemini 3 Pro - produce plan (TSD)
+        id: gemini-plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ISSUE_KEY="${{ steps.payload.outputs.issue_key }}"
+          TITLE=$(cat .artifacts/jira-title.txt)
+          DESCRIPTION=$(cat .artifacts/jira-description.txt)
+          DOCS_CONTEXT=$(cat .artifacts/docs-summary.txt 2>/dev/null || echo "No docs available")
+
+          echo "🧠 Creating implementation plan with Gemini 3 Pro..."
+
+          # Build the planning prompt
+          # CUSTOMIZE: Update PLATFORM CONTEXT to describe YOUR project
+          cat > .artifacts/plan-prompt.txt << PROMPT_EOF
+          You are a senior software architect. Create a COMPLETE implementation plan for a Jira task.
+
+          PLATFORM CONTEXT:
+          # ============================================================================
+          # CUSTOMIZE THIS SECTION FOR YOUR PROJECT
+          # ============================================================================
+          # Describe your project's:
+          # - Tech stack (e.g., "Next.js 14 + PostgreSQL + Prisma")
+          # - Architecture (e.g., "Microservices with API Gateway")
+          # - Key features (e.g., "E-commerce platform with real-time inventory")
+          # - Important patterns (e.g., "Repository pattern, CQRS")
+          # ============================================================================
+
+          PROJECT DOCUMENTATION:
+          $DOCS_CONTEXT
+
+          TASK TO PLAN:
+          - ID: $ISSUE_KEY
+          - Title: $TITLE
+          - Description:
+          $DESCRIPTION
+
+          CREATE A DETAILED IMPLEMENTATION PLAN with:
+
+          1. GOAL: Clear 1-2 sentence summary
+
+          2. SCOPE:
+             - Files to create/modify (with exact paths)
+             - Database changes needed
+             - Modules affected
+
+          3. IMPLEMENTATION STEPS:
+             - Step 1: Database/Schema changes
+             - Step 2: Backend/API changes
+             - Step 3: Frontend/UI changes
+             - Step 4: Integration points
+
+          4. CODE EXAMPLES:
+             - Provide COMPLETE code for each file
+             - Include proper imports, types, error handling
+             - Follow project's existing patterns and best practices
+
+          5. ACCEPTANCE CRITERIA:
+             - Specific testable criteria
+
+          6. RISKS AND MITIGATIONS
+
+          7. DEPLOYMENT RUNBOOK
+
+          Be specific with file paths and provide COMPLETE, WORKING code examples.
+          PROMPT_EOF
+
+          # Build Gemini request
+          jq -n \
+            --rawfile prompt .artifacts/plan-prompt.txt \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{text: $prompt}]
+              }],
+              generationConfig: {
+                temperature: 0.3,
+                maxOutputTokens: 65536
+              }
+            }' > .artifacts/gemini-plan-request.json
+
+          # Check if we have images
+          if [ -f .artifacts/images.json ] && [ "${{ steps.fetch-images.outputs.has_images }}" = "true" ]; then
+            echo "🖼️ Adding images to request..."
+
+            # Start with text part
+            jq -n --rawfile text .artifacts/plan-prompt.txt '[{text: $text}]' > .artifacts/parts-array.json
+
+            # Add each image
+            IMAGE_INDEX=0
+            jq -c '.images[]' .artifacts/images.json 2>/dev/null | while IFS= read -r image; do
+              IMAGE_INDEX=$((IMAGE_INDEX + 1))
+
+              echo "$image" | jq -r '.data_uri' | sed 's/data:image\/[^;]*;base64,//' | tr -d '\n\r' > .artifacts/image-b64-${IMAGE_INDEX}.txt
+              MIME_TYPE=$(echo "$image" | jq -r '.data_uri' | sed -n 's/data:\([^;]*\);base64,.*/\1/p')
+
+              B64_DATA=$(cat .artifacts/image-b64-${IMAGE_INDEX}.txt)
+
+              jq --arg b64 "$B64_DATA" --arg mime "$MIME_TYPE" \
+                '. += [{inline_data: {mime_type: $mime, data: $b64}}]' \
+                .artifacts/parts-array.json > .artifacts/parts-array-tmp.json
+
+              mv .artifacts/parts-array-tmp.json .artifacts/parts-array.json
+            done
+
+            # Build multimodal request
+            jq -n \
+              --slurpfile parts .artifacts/parts-array.json \
+              '{
+                contents: [{
+                  role: "user",
+                  parts: $parts[0]
+                }],
+                generationConfig: {
+                  temperature: 0.3,
+                  maxOutputTokens: 65536
+                }
+              }' > .artifacts/gemini-plan-request.json
           fi
 
-      - name: Claude Opus 4.5 - produce plan (TSD)
-        id: opus-plan
-        uses: anthropics/claude-code-action@v1
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GH_PAT }}
-          show_full_output: true
-          prompt: |
-            You are a senior software architect using Claude Opus 4.5. Your task is to create a COMPLETE, ACTIONABLE implementation plan.
+          echo "📤 Sending request to Gemini 3 Pro..."
+          echo "Request size: $(wc -c < .artifacts/gemini-plan-request.json) bytes"
 
-            IMPORTANT:
-            - You are ONLY creating a plan, NOT implementing code
-            - Output the FULL PLAN as markdown text
-            - Do NOT create any files or make any code changes
-            - Just analyze and output the plan to stdout
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/gemini-plan-request.json > .artifacts/gemini-plan-response.json
 
-            Context: This is a Next.js 14 (App Router) + PostgreSQL + Socket.IO sales platform. The codebase has TSD.md with architecture overview, but you must create NEW specific implementation steps for THIS task.
+          echo "📥 Response received"
 
-            Task to Plan:
-            - ID: ${{ steps.payload.outputs.issue_key }}
-            - Title: ${{ steps.jira.outputs.title }}
-            - Description:
-            ${{ steps.jira.outputs.description }}
+          # Check for errors
+          if jq -e '.error' .artifacts/gemini-plan-response.json > /dev/null 2>&1; then
+            echo "❌ Gemini API Error:"
+            jq '.error' .artifacts/gemini-plan-response.json
+            exit 1
+          fi
 
-            ${{ steps.fetch-images.outputs.has_images == 'true' && format('NOTE: This ticket has {0} attached image(s) showing visual context (UI mockups, screenshots, diagrams). The implementation agent will receive these images. Include visual considerations in your plan where relevant.', steps.fetch-images.outputs.image_count) || '' }}
+          # Extract plan from response
+          PLAN=$(jq -r '.candidates[0].content.parts[0].text // empty' .artifacts/gemini-plan-response.json)
 
-            FIRST: Read and understand the codebase structure:
-            - Read TSD.md for architecture overview
-            - Explore relevant directories to understand patterns
-            - Check existing similar implementations
+          if [ -z "$PLAN" ] || [ ${#PLAN} -lt 100 ]; then
+            echo "❌ ERROR: Plan is empty or too short!"
+            cat .artifacts/gemini-plan-response.json
+            exit 1
+          fi
 
-            THEN: Output your plan in this format:
+          # Add issue ID header if not present
+          if ! echo "$PLAN" | grep -q "$ISSUE_KEY"; then
+            echo "# Implementation Plan for $ISSUE_KEY" > .artifacts/PLAN.md
+            echo "" >> .artifacts/PLAN.md
+            echo "$PLAN" >> .artifacts/PLAN.md
+          else
+            echo "$PLAN" > .artifacts/PLAN.md
+          fi
 
-            # Implementation Plan for ${{ steps.payload.outputs.issue_key }}
+          PLAN_SIZE=$(wc -c < .artifacts/PLAN.md)
+          echo "✅ Plan created: $PLAN_SIZE bytes"
+          head -50 .artifacts/PLAN.md
 
-            ## 1. Goal
-            [Clear 1-2 sentence summary of what needs to be implemented]
-
-            ## 2. Scope
-            **Files to create/modify:**
-            - `path/to/file1.ts` - [what changes]
-            - `path/to/file2.tsx` - [what changes]
-            - `path/to/file3.sql` - [what changes]
-
-            **Modules affected:**
-            - [list affected modules/features]
-
-            ## 3. Implementation Steps
-            **Step 1: [Database/Schema Changes]**
-            - Specific SQL changes needed
-            - Table/column additions or modifications
-            - Migration file path
-
-            **Step 2: [Backend/API Changes]**
-            - API routes to create/modify (with paths)
-            - Helper functions to add/update
-            - Types/interfaces to define
-
-            **Step 3: [Frontend/UI Changes]**
-            - Components to create/modify
-            - UI flow changes
-            - State management updates
-
-            **Step 4: [Integration]**
-            - How components connect
-            - API integration points
-            - Socket events if needed
-
-            ## 4. Acceptance Criteria
-            - [ ] [Specific testable criterion 1]
-            - [ ] [Specific testable criterion 2]
-            - [ ] [Specific testable criterion 3]
-            - [ ] [Add 3-6 total checkboxes]
-
-            ## 5. Code Examples
-            For each file to create/modify, provide the COMPLETE code:
-
-            ### File: `path/to/file.ts`
-            ```typescript
-            // Complete implementation code here
-            ```
-
-            ## 6. Risks and Mitigations
-            - **Risk:** [specific risk]
-              **Mitigation:** [how to handle it]
-
-            ## 7. Runbook
-            **To Deploy:**
-            ```bash
-            [specific commands]
-            ```
-
-            **To Verify:**
-            - [How to check it's working]
-
-            CRITICAL RULES:
-            1. Read the codebase first to understand existing patterns
-            2. Output the COMPLETE plan with FULL CODE EXAMPLES
-            3. Be specific with file paths (use actual repo structure)
-            4. Include concrete implementation details that can be directly used
-            5. If task seems already implemented, state that clearly
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 30
-            --model claude-opus-4-5-20251101
-
-      - name: Save plan to artifact
-        run: |
-          mkdir -p .artifacts
-          cat > .artifacts/PLAN.md << 'EOF'
-          ${{ steps.opus-plan.outputs.response }}
-          EOF
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ai-plan
+          name: ai-plan-${{ github.run_id }}
           path: .artifacts/PLAN.md
+          retention-days: 1
 
-      - name: Upload image context artifact
+      - name: Upload images artifact
         if: steps.fetch-images.outputs.has_images == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: image-context
-          path: .artifacts/image-context.md
+          name: ai-images-${{ github.run_id }}
+          path: .artifacts/images/
+          retention-days: 1
 
-  gemini-implement:
+  opus-implement:
     runs-on: ubuntu-latest
-    needs: opus-plan
+    needs: gemini-plan
     permissions:
       contents: write
       pull-requests: write
       issues: write
     env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GH_TOKEN: ${{ secrets.GH_PAT }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Clean artifacts directory
+        run: rm -rf .artifacts && mkdir -p .artifacts
+
       - uses: actions/download-artifact@v4
         with:
-          name: ai-plan
+          name: ai-plan-${{ github.run_id }}
           path: .artifacts
 
-      - name: Download image context artifact
+      - name: Download images artifact
         id: download-images
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: image-context
-          path: .artifacts
+          name: ai-images-${{ github.run_id }}
+          path: .artifacts/images
 
-      - name: Read plan from artifact
-        id: read-plan
+      - name: Verify plan artifact
+        env:
+          ISSUE_KEY: ${{ github.event.client_payload.issue_key }}
         run: |
-          PLAN=$(cat .artifacts/PLAN.md)
-          echo "plan<<EOF" >> $GITHUB_OUTPUT
-          echo "$PLAN" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "📄 Verifying plan for issue: $ISSUE_KEY"
 
-      - name: Read image context
-        id: read-images
-        if: steps.download-images.outcome == 'success'
-        run: |
-          if [ -f .artifacts/image-context.md ]; then
-            echo "has_images=true" >> $GITHUB_OUTPUT
-            echo "context<<EOF" >> $GITHUB_OUTPUT
-            cat .artifacts/image-context.md >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            echo "✅ Image context loaded"
-          else
-            echo "has_images=false" >> $GITHUB_OUTPUT
+          if [ ! -f .artifacts/PLAN.md ]; then
+            echo "❌ PLAN.md not found!"
+            ls -la .artifacts/
+            exit 1
           fi
+
+          PLAN_SIZE=$(wc -c < .artifacts/PLAN.md)
+          echo "Plan size: $PLAN_SIZE bytes"
+
+          if [ "$PLAN_SIZE" -lt 100 ]; then
+            echo "❌ ERROR: Plan is empty!"
+            cat .artifacts/PLAN.md
+            exit 1
+          fi
+
+          if ! grep -q "$ISSUE_KEY" .artifacts/PLAN.md; then
+            echo "❌ ERROR: Plan is for wrong issue!"
+            echo "Expected: $ISSUE_KEY"
+            head -5 .artifacts/PLAN.md
+            exit 1
+          fi
+
+          echo "✅ Plan validated for $ISSUE_KEY"
 
       - name: Setup Git
         run: |
+          # CUSTOMIZE: Change bot name and email if desired
           git config user.name "Azmi Bot"
           git config user.email "azmi-bot@users.noreply.github.com"
 
@@ -299,127 +396,94 @@ jobs:
         run: |
           ISSUE_KEY="${{ github.event.client_payload.issue_key || 'ai-task' }}"
           BRANCH_NAME="feature/${ISSUE_KEY}"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "🗑️ Deleting existing remote branch: $BRANCH_NAME"
+            git push origin --delete "$BRANCH_NAME" || true
+          fi
+
           git checkout -b "$BRANCH_NAME"
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "✅ Created branch: $BRANCH_NAME"
 
-      - name: Gemini 3 Pro - implement code from plan
-        id: gemini-implement
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Claude Opus 4.5 - evaluate, revise & implement
+        id: opus-implement
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
+          # CUSTOMIZE: Update PLATFORM CONTEXT to describe YOUR project
+          prompt: |
+            You are a senior software engineer and technical lead. Your job is to:
+            1. EVALUATE the implementation plan
+            2. REVISE it if needed
+            3. IMPLEMENT the code changes
 
-          echo "🚀 Starting Gemini 3 Pro implementation..."
+            ═══════════════════════════════════════════════════════════════
+            PHASE 1: EVALUATE THE PLAN
+            ═══════════════════════════════════════════════════════════════
 
-          # Read the plan
-          PLAN=$(cat .artifacts/PLAN.md)
+            Read the plan from: .artifacts/PLAN.md
 
-          # Build the implementation prompt
-          cat > .artifacts/implement-prompt.txt << 'PROMPT_EOF'
-          You are a senior software engineer implementing code based on a detailed plan.
+            Evaluate it against these criteria:
+            - Is the goal clear and correctly understood?
+            - Are file paths specific and correct for this codebase?
+            - Are code examples complete with proper imports/types?
+            - Is the approach feasible and following best practices?
+            - Are there any missing pieces or incorrect assumptions?
 
-          TASK: Implement the code changes described in the plan below.
+            ═══════════════════════════════════════════════════════════════
+            PHASE 2: REVISE IF NEEDED
+            ═══════════════════════════════════════════════════════════════
 
-          IMPORTANT OUTPUT FORMAT:
-          You must output a JSON object with this exact structure:
-          {
-            "files": [
-              {
-                "path": "relative/path/to/file.ts",
-                "action": "create" | "modify" | "delete",
-                "content": "full file content here"
-              }
-            ],
-            "commit_message": "descriptive commit message",
-            "pr_body": "markdown description for PR"
-          }
+            If the plan has issues:
+            - Identify what's wrong or missing
+            - Read the actual codebase to understand existing patterns
+            - Create a REVISED plan that fixes the issues
+            - Save the revised plan to .artifacts/PLAN-REVISED.md
 
-          RULES:
-          1. For "create" action: provide the complete new file content
-          2. For "modify" action: provide the COMPLETE file content (not just changes)
-          3. For "delete" action: content can be empty
-          4. Follow the plan exactly - implement all specified changes
-          5. Use TypeScript/JavaScript best practices
-          6. Include proper error handling
-          7. Follow existing code patterns mentioned in the plan
+            If the plan is good as-is, proceed directly to implementation.
 
-          IMPLEMENTATION PLAN:
-          ---
-          PROMPT_EOF
+            ═══════════════════════════════════════════════════════════════
+            PHASE 3: IMPLEMENT
+            ═══════════════════════════════════════════════════════════════
 
-          echo "$PLAN" >> .artifacts/implement-prompt.txt
+            Using the plan (original or revised), implement ALL changes.
 
-          # Build Gemini request with structured output
-          jq -n \
-            --rawfile prompt .artifacts/implement-prompt.txt \
-            '{
-              contents: [{
-                role: "user",
-                parts: [{text: $prompt}]
-              }],
-              generationConfig: {
-                responseMimeType: "application/json",
-                temperature: 0.2,
-                maxOutputTokens: 65536
-              }
-            }' > .artifacts/gemini-implement-request.json
+            # ============================================================================
+            # CUSTOMIZE: Update this section with YOUR project's context
+            # ============================================================================
+            # PLATFORM CONTEXT:
+            # - Your tech stack (e.g., "Next.js 14 + PostgreSQL")
+            # - Key directories (e.g., "src/, app/, lib/")
+            # - Important files (e.g., "Routes in app/api/")
+            # ============================================================================
 
-          echo "📤 Sending implementation request to Gemini 3 Pro..."
+            IMPLEMENTATION RULES:
+            1. READ existing files before modifying them
+            2. Use the Write tool to create/modify files
+            3. Write COMPLETE file contents (not partial updates)
+            4. Follow existing code patterns in the repo
+            5. Include proper error handling and types
+            6. Do NOT create test files unless explicitly needed
+            7. Do NOT modify unrelated files
 
-          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
-            -H "x-goog-api-key: $GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d @.artifacts/gemini-implement-request.json > .artifacts/gemini-response.json
+            ═══════════════════════════════════════════════════════════════
+            IMPORTANT: YOU MUST COMPLETE ALL THREE PHASES
+            ═══════════════════════════════════════════════════════════════
 
-          echo "📥 Response received"
+            Do not stop after evaluation. Do not stop after revision.
+            Your job is to deliver WORKING CODE at the end.
 
-          # Extract the JSON response
-          RESPONSE_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/gemini-response.json)
-          echo "$RESPONSE_TEXT" > .artifacts/implementation.json
-
-          echo "✅ Implementation plan parsed"
-
-      - name: Apply code changes
-        id: apply-changes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "📝 Applying code changes..."
-
-          # Parse the implementation JSON
-          IMPL_JSON=$(cat .artifacts/implementation.json)
-
-          # Process each file
-          echo "$IMPL_JSON" | jq -c '.files[]' | while IFS= read -r file; do
-            FILE_PATH=$(echo "$file" | jq -r '.path')
-            ACTION=$(echo "$file" | jq -r '.action')
-            CONTENT=$(echo "$file" | jq -r '.content')
-
-            echo "Processing: $FILE_PATH ($ACTION)"
-
-            case "$ACTION" in
-              "create"|"modify")
-                # Create directory if needed
-                mkdir -p "$(dirname "$FILE_PATH")"
-                # Write file content
-                echo "$CONTENT" > "$FILE_PATH"
-                echo "✅ Written: $FILE_PATH"
-                ;;
-              "delete")
-                if [ -f "$FILE_PATH" ]; then
-                  rm "$FILE_PATH"
-                  echo "🗑️  Deleted: $FILE_PATH"
-                fi
-                ;;
-            esac
-          done
-
-          # Extract commit message and PR body
-          echo "$IMPL_JSON" | jq -r '.commit_message' > .artifacts/commit-message.txt
-          echo "$IMPL_JSON" | jq -r '.pr_body' > .artifacts/pr-body.txt
-
-          echo "✅ All changes applied"
+            Start by reading .artifacts/PLAN.md now.
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 75
+            --model claude-opus-4-5-20251101
 
       - name: Commit and push changes
         id: commit
@@ -429,24 +493,27 @@ jobs:
 
           # Check if there are changes
           if git diff --quiet && git diff --staged --quiet; then
-            echo "⚠️  No changes to commit"
+            echo "⚠️ No changes to commit"
             echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           git add -A
 
-          # Use commit message from Gemini or default
-          if [ -f .artifacts/commit-message.txt ]; then
-            COMMIT_MSG=$(cat .artifacts/commit-message.txt)
-          else
-            COMMIT_MSG="Implement ${ISSUE_KEY}"
+          # Don't commit .artifacts
+          git reset .artifacts/ 2>/dev/null || true
+
+          # Check again after reset
+          if git diff --staged --quiet; then
+            echo "⚠️ No changes to commit (only artifacts)"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          git commit -m "$COMMIT_MSG
+          git commit -m "feat($ISSUE_KEY): Implement changes from AI plan
 
-          🤖 Implemented by Gemini 3 Pro
-          📋 Planned by Claude Opus 4.5"
+          🤖 Implemented by Claude Opus 4.5
+          📋 Planned by Gemini 3 Pro"
 
           git push -u origin "$BRANCH_NAME"
 
@@ -461,19 +528,11 @@ jobs:
           ISSUE_KEY="${{ github.event.client_payload.issue_key || 'ai-task' }}"
           BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
 
-          # Build PR body
-          if [ -f .artifacts/pr-body.txt ]; then
-            PR_DESCRIPTION=$(cat .artifacts/pr-body.txt)
-          else
-            PR_DESCRIPTION="Implementation for ${ISSUE_KEY}"
-          fi
-
-          # Read the plan for PR body
           PLAN=$(cat .artifacts/PLAN.md)
 
           PR_BODY="## 🤖 AI Coding - ${ISSUE_KEY}
 
-          ### Implementation Plan (by Claude Opus 4.5)
+          ### Implementation Plan (by Gemini 3 Pro)
           <details>
           <summary>Click to expand plan</summary>
 
@@ -481,15 +540,11 @@ jobs:
 
           </details>
 
-          ### Changes Made (by Gemini 3 Pro)
-          ${PR_DESCRIPTION}
-
           ---
-          🧠 **Planned by:** Claude Opus 4.5
-          ⚡ **Implemented by:** Gemini 3 Pro
+          🧠 **Planned by:** Gemini 3 Pro
+          ⚡ **Implemented by:** Claude Opus 4.5
           "
 
-          # Create PR
           gh pr create \
             --title "AI Coding - ${ISSUE_KEY}" \
             --body "$PR_BODY" \
@@ -508,13 +563,12 @@ jobs:
           ISSUE_KEY='${{ github.event.client_payload.issue_key }}'
 
           if [ -z "$ISSUE_KEY" ] || [ "$ISSUE_KEY" = "null" ]; then
-            echo "No Jira issue key found, skipping Jira update"
+            echo "No Jira issue key found, skipping"
             exit 0
           fi
 
           AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
 
-          # Create ADF comment
           jq -n \
             --arg repo "${{ github.repository }}" \
             --arg workflow_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
@@ -531,7 +585,7 @@ jobs:
                   {
                     type: "paragraph",
                     content: [
-                      { type: "text", text: "Implementation in progress using Claude Opus 4.5 (planning) + Gemini 3 Pro (coding)." }
+                      { type: "text", text: "Implementation in progress using Gemini 3 Pro (planning) + Claude Opus 4.5 (coding)." }
                     ]
                   },
                   {
@@ -547,12 +601,6 @@ jobs:
                       { type: "text", text: "Workflow: ", marks: [{ type: "strong" }] },
                       { type: "text", text: $workflow_url, marks: [{ type: "link", attrs: { href: $workflow_url } }] }
                     ]
-                  },
-                  {
-                    type: "paragraph",
-                    content: [
-                      { type: "text", text: "A pull request will be created shortly and reviewed automatically.", marks: [{ type: "em" }] }
-                    ]
                   }
                 ]
               }
@@ -564,4 +612,4 @@ jobs:
             -H "Content-Type: application/json" \
             -d @/tmp/jira-comment.json
 
-          echo "✅ Posted implementation status to Jira issue $ISSUE_KEY"
+          echo "✅ Posted status to Jira"
